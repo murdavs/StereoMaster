@@ -1,0 +1,10 @@
+{
+  "dir_input_videos": "C:\\proyecto\\projects\\default\\input_videos",
+  "dir_pre_depth": "C:\\proyecto\\projects\\default\\pre_depth",
+  "dir_pre_depth2": "C:\\proyecto\\projects\\default\\pre_depth2",
+  "dir_pre_depth_final": "C:\\proyecto\\projects\\default\\pre_depth_final",
+  "dir_output_splattings": "C:\\proyecto\\projects\\default\\output_splattings",
+  "dir_inpainting_out": "C:\\proyecto\\projects\\default\\inpainting_out",
+  "dir_completed_merged": "C:\\proyecto\\projects\\default\\completed_merged",
+  "disclaimer_accepted": false
+}

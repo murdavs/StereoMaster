@@ -1,0 +1,8 @@
+.vscode/
+checkpoints/
+stereomaster_env/
+weights/
+__pycache__
+*/__pycache__
+*.pyc
+projects/

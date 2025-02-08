@@ -1,0 +1,16 @@
+{
+  "crafter_overlap": 25,
+  "crafter_window": 70,
+  "crafter_maxres_value": 960,
+  "crafter_denoising_steps": 8,
+  "crafter_guidance_scale": 1.2,
+  "crafter_seed": 42,
+  "vda_maxres_value": 1024,
+  "vda_use_fp16": true,
+  "vda_use_cudnn": true,
+  "vda_input_size": 512,
+  "vda_encoder": "vitl",
+  "inpaint_threshold_batch": 0.005,
+  "sbs_mode": "HSBS",
+  "output_encoder": "x264"
+}
