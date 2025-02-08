@@ -40,7 +40,7 @@
    - Generate depth maps (using Crafter or VDA).
    - Perform splatting and inpainting to fill any holes.
    - Adjust disparity, convergence, etc.
-   - Check Polylines or Anaglyph preview modes.
+   - Check Anaglyph preview modes.
 5. **Export** your result in side-by-side format (HSBS or FSBS).
 
 ## Limitations
