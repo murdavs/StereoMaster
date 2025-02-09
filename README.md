@@ -204,7 +204,7 @@ Expected:
 
        cd assets
 
-2. Install the Triton wheel (example):
+2. Install the Triton wheel:
 
        pip install triton-3.1.0-cp312-cp312-win_amd64.whl
 
@@ -236,9 +236,9 @@ Expected:
 
 2. Run the installer (accepting the default options is usually fine).
 
-	
+---	
 
-### 11. Install Hugging Face CLI & Download Model Weights
+### 11. Login in Hugging Face CLI & Download Model Weights
 
 1. Login in Hugging Face CLI:
 
@@ -300,7 +300,7 @@ Provided “as is.” Use at your own risk; no warranty is given for potential d
 
 ---
 
-## Example Screenshot
+## Screenshot
 
 Below is a sample image of **StereoMaster** in action:
 
