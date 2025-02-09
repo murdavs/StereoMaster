@@ -291,7 +291,7 @@ After **all steps** are completed:
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/3dultraenhancer)
 
-If you find StereoMaster helpful or would like to support further development, consider [buying me a coffee](https://ko-fi.com/your-kofi-user). Thank you!
+If you find StereoMaster helpful or would like to support further development, consider [buying me a coffee](https://ko-fi.com/3dultraenhancer)). Thank you!
 
 
 ## License
