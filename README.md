@@ -160,7 +160,18 @@ Expected output:
 
 ---
 
-### 6. Clone the StereoMaster Repository
+### 6. Install Git
+
+1. Download from:  
+   [Git for Windows](https://git-scm.com/download/win)
+
+2. Run the installer (accepting the default options is usually fine).
+
+
+---	
+
+
+### 7. Clone the StereoMaster Repository
 
     cd C:\
     git clone https://github.com/murdavs/StereoMaster.git
@@ -168,7 +179,7 @@ Expected output:
 
 ---
 
-### 7. Create a Virtual Environment & Install Dependencies
+### 8. Create a Virtual Environment & Install Dependencies
 
 1. Create a new virtual environment:
 
@@ -198,7 +209,7 @@ Expected:
 
 ---
 
-### 8. Install Triton (Updated for Python 3.12)
+### 9. Install Triton (Updated for Python 3.12)
 
 1. Navigate to the `assets` folder:
 
@@ -210,7 +221,7 @@ Expected:
 
 ---
 
-### 9. Compile Forward Warp
+### 10. Compile Forward Warp
 
 1. Go to the Forward-Warp folder:
 
@@ -229,14 +240,6 @@ Expected:
 
 ---
 
-### 10. Install Git
-
-1. Download from:  
-   [Git for Windows](https://git-scm.com/download/win)
-
-2. Run the installer (accepting the default options is usually fine).
-
----	
 
 ### 11. Login in Hugging Face CLI & Download Model Weights
 
