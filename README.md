@@ -86,7 +86,7 @@ Ensure it points to the real Python installation
     - Windows 10/11 SDK    
     - MSVC v143 - VS 2022 C++ x64/x86 (14.40-17.10)  
 	- C++ compilation tools for MSVC v143-VS 2022 for x64/x86 (latest)
-    - C++ Spectre-mitigated libraries  
+    - Spectre-mitigated libraries for MSVC v143 – VS 2022 C++ x64/x86 (v14.40–17.10) 
 
    *(If you don’t see these options, check **Individual Components**.)*
 
@@ -291,7 +291,7 @@ After **all steps** are completed:
 
 ---
 
-# Forward Warp CUDA Extension Installation Troubleshooting (Windows)
+## Forward Warp CUDA Extension Installation Troubleshooting (Windows)
 
 1. **Check Microsoft Visual C++ Build Tools Installation**  
    - Make sure that all the packages listed in step 3 are installed with the specified versions.
