@@ -85,6 +85,7 @@ Ensure it points to the real Python installation
     - C++ CMake tools for Windows  
     - Windows 10/11 SDK    
     - MSVC v143 - VS 2022 C++ x64/x86 (14.40-17.10)  
+	- C++ compilation tools for MSVC v143-VS 2022 for x64/x86 (latest)
     - C++ Spectre-mitigated libraries  
 
    *(If you don’t see these options, check **Individual Components**.)*
@@ -290,12 +291,29 @@ After **all steps** are completed:
 
 ---
 
+# Forward Warp CUDA Extension Installation Troubleshooting (Windows)
+
+1. **Check Microsoft Visual C++ Build Tools Installation**  
+   - Make sure that all the packages listed in step 3 are installed with the specified versions.
+   - This ensures `cl.exe` and associated tools are available.
+
+2. **Open the Correct Developer Command Prompt**  
+   - Run the following command before running the Forward-Warp CUDA installation script to configure the environment for 64-bit builds:
+     ```
+     "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+     ```
+   - This ensures that the compiler (`cl.exe`) is on your PATH and recognized.
+   
+   
+---
+
 ## Ko-fi Support
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/3dultraenhancer)
 
 If you find StereoMaster helpful or would like to support further development, consider [buying me a coffee](https://ko-fi.com/3dultraenhancer)). Thank you!
 
+---
 
 ## License
 
@@ -308,3 +326,11 @@ Provided “as is.” Use at your own risk; no warranty is given for potential d
 Below is a sample image of **StereoMaster** in action:
 
 ![StereoMaster Screenshot](assets/screenshot.png)
+
+
+
+
+
+
+
+
