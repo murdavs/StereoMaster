@@ -33,3 +33,4 @@ setuptools
 wheel
 ninja
 scenedetect
+color-matcher

@@ -1,4 +1,5 @@
 import os
+os.environ["XFORMERS_FORCE_DISABLE_TRITON"] = "1"
 import glob
 import gc
 import time

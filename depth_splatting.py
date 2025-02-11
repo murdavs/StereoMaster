@@ -660,7 +660,7 @@ def DepthSplatting2x2(
         left_t= torch.from_numpy(bf).permute(0,3,1,2).float().cuda()
         disp_t= torch.from_numpy(bd).unsqueeze(1).float().cuda()
         with torch.no_grad():
-            right_t, occ_t= stereo(left_t, disp_t, convergence=conv_val)
+            right_t, occ_t= stereo(left_t, disp_t, convergence=0.0)
 
         rn= right_t.cpu().permute(0,2,3,1).numpy()
         on= occ_t.cpu().permute(0,2,3,1).numpy()
@@ -813,7 +813,7 @@ def DepthSplattingTriple(
         left_t= torch.from_numpy(bf).permute(0,3,1,2).float().cuda()
         disp_t= torch.from_numpy(bd).unsqueeze(1).float().cuda()
         with torch.no_grad():
-            right_t, occ_t= stereo(left_t, disp_t, convergence=conv_val)
+            right_t, occ_t= stereo(left_t, disp_t, convergence=0.00)
 
         rn= right_t.cpu().permute(0,2,3,1).numpy()
         on= occ_t.cpu().permute(0,2,3,1).numpy()
