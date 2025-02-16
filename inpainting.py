@@ -1,7 +1,9 @@
 import os
 os.environ["XFORMERS_FORCE_DISABLE_TRITON"] = "1"
+os.environ["OPENCV_IO_ENABLE_OPENEXR"]="1"
 import glob
 import gc
+import cv2
 import time
 import numpy as np
 import shutil
@@ -10,12 +12,76 @@ from fire import Fire
 from decord import VideoReader, cpu
 import torch
 import torch.nn.functional as F
-
+from color_matcher import ColorMatcher
+from color_matcher.normalizer import Normalizer
+cm = ColorMatcher()
 from transformers import CLIPVisionModelWithProjection
 from diffusers import AutoencoderKLTemporalDecoder, UNetSpatioTemporalConditionModel
-
 from pipelines.stereo_video_inpainting import StableVideoDiffusionInpaintingPipeline, tensor2vid
 import imageio_ffmpeg 
+
+
+#######################################################
+# Additional helper functions for local color matching
+#######################################################
+def find_best_match_region(template_np, search_np):
+    """
+    Searches for the best match of 'template_np' in 'search_np'
+    using cv2.matchTemplate. Returns (top_y, left_x) as location.
+    """
+    tmpl_gray = cv2.cvtColor(template_np, cv2.COLOR_BGR2GRAY)
+    srch_gray = cv2.cvtColor(search_np, cv2.COLOR_BGR2GRAY)
+    if tmpl_gray.shape[0] > srch_gray.shape[0] or tmpl_gray.shape[1] > srch_gray.shape[1]:
+        return 0, 0
+
+    method = cv2.TM_CCOEFF_NORMED
+    res = cv2.matchTemplate(srch_gray, tmpl_gray, method)
+    _, _, min_loc, max_loc = cv2.minMaxLoc(res)
+    if method in [cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED]:
+        top_left = min_loc
+    else:
+        top_left = max_loc
+    return (top_left[1], top_left[0])  # (row, col)
+
+
+def local_color_match_masked_region(final_right, left_frame, mask, cm):
+    """
+    Takes 'final_right' (inpainted area), finds bounding box in 'mask',
+    searches a similar region in 'left_frame', and applies color transfer.
+    Returns the updated 'final_right'.
+    """
+    mask_indices = (mask[0] > 0).nonzero(as_tuple=True)
+    if len(mask_indices[0]) == 0:
+        return final_right
+
+    y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
+    x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
+
+    # Crop region from final_right
+    region_crop = final_right[:, y_min:y_max+1, x_min:x_max+1].clone()
+    region_crop_np = (region_crop.permute(1,2,0).cpu().numpy() * 255.0).clip(0,255).astype("uint8")
+
+    # Convert left_frame to numpy
+    left_frame_np = (left_frame.permute(1,2,0).cpu().numpy() * 255.0).clip(0,255).astype("uint8")
+
+    # Find best match in left_frame_np
+    top_y, left_x = find_best_match_region(region_crop_np, left_frame_np)
+    Hr, Wr, _ = region_crop_np.shape
+    left_sub = left_frame_np[top_y:top_y+Hr, left_x:left_x+Wr, :].copy()
+    if left_sub.shape[0] != Hr or left_sub.shape[1] != Wr:
+        return final_right
+
+    # Local color transfer
+    matched_np = cm.transfer(src=region_crop_np, ref=left_sub, method='mkl')
+    matched_np = np.clip(matched_np, 0, 255).astype('uint8')
+
+    matched_t = (torch.from_numpy(matched_np).float().permute(2,0,1)/255.0).to(final_right.device)
+
+    # Replace region in final_right
+    out_right = final_right.clone()
+    out_right[:, y_min:y_max+1, x_min:x_max+1] = matched_t
+
+    return out_right
 
 
 #######################################################
@@ -54,7 +120,8 @@ def blend_v(a: torch.Tensor, b: torch.Tensor, overlap_size: int) -> torch.Tensor
 #######################################################
 def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128)) -> torch.Tensor:
     """
-    If tile_num>1, zero-pad the frames so each tile can be
+    If tile_num <= 1, no padding is needed.
+    Otherwise, zero-pad the frames so each tile can be
     extracted with the required overlap.
     """
     if tile_num <= 1:
@@ -70,7 +137,7 @@ def pad_for_tiling(frames: torch.Tensor, tile_num: int, tile_overlap=(128, 128))
     stride_x = tile_size_x - ov_x
 
     ideal_h = stride_y*tile_num + ov_y*(tile_num-1)
-    ideal_w = stride_x*tile_num + ov_x*(tile_num-1)
+    ideal_w = stride_y*tile_num + ov_x*(tile_num-1)  # We do NOT modify original logic
 
     pad_bottom = max(0, ideal_h - H)
     pad_right  = max(0, ideal_w - W)
@@ -91,7 +158,6 @@ def spatial_tiled_process(
     spatial_n_compress: int=8,
     **kargs
 ):
-
     start_t = time.time()
 
     height = cond_frames.shape[2]
@@ -132,7 +198,7 @@ def spatial_tiled_process(
                 width=cond_tile.shape[3],
                 num_frames=len(cond_tile),
                 output_type="latent",
-                **kargs  # <-- AQUÍ entran num_inference_steps, etc.
+                **kargs
             )
             dt_tile = time.time() - t0
 
@@ -149,7 +215,7 @@ def spatial_tiled_process(
         tile_overlap[1] // spatial_n_compress
     )
 
-    # Mezcla vertical/horizontal
+    # Vertical/horizontal blending
     for i in range(tile_num):
         for j in range(tile_num):
             tile = row_tiles[i][j]
@@ -159,7 +225,7 @@ def spatial_tiled_process(
                 tile = blend_h(row_tiles[i][j-1], tile, latent_overlap[1])
             row_tiles[i][j] = tile
 
-    # Coser horizontal en cada fila
+    # Stitch horizontally in each row
     for i in range(tile_num):
         line_ = row_tiles[i]
         for j in range(tile_num):
@@ -172,11 +238,72 @@ def spatial_tiled_process(
         row_cat = torch.cat(line_, dim=3)
         row_tiles[i] = row_cat
 
-    # Finalmente coser filas
     final_latent = torch.cat(row_tiles, dim=2)
     dt_spatial = time.time() - start_t
 
     return final_latent
+
+
+import OpenEXR
+import Imath
+import array
+
+def save_exr_sequence_color(frames_np, out_dir, half_float=False):
+    """
+    Saves a sequence of color frames as EXR files using OpenCV.
+    frames_np => shape [T, H, W, 3], float32 [0..1].
+    half_float => if True, stores as half-float (16-bit).
+    """
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    T, H, W, C = frames_np.shape
+    if C != 3:
+        print("[ERROR] => frames_np must be 3 channels.")
+        return
+
+    for i in range(T):
+        frame = frames_np[i]
+        exr_flags = []
+        if half_float:
+            exr_flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_HALF]
+        else:
+            exr_flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT]
+
+        out_exr = os.path.join(out_dir, f"frame_{i:04d}.exr")
+        success = cv2.imwrite(out_exr, frame, exr_flags)
+        if not success:
+            print(f"[ERROR] => Could not write EXR => {out_exr}")
+        else:
+            print(f"[EXR] => Wrote {out_exr}")
+
+
+def float32_to_half_bytes(frame_2d):
+    import Imath, array
+    H,W = frame_2d.shape
+    arr_ = []
+    for val in frame_2d.flatten():
+        half_ = Imath.FloatToHalf(val)
+        arr_.append(half_)
+    return array.array('H', arr_).tobytes()
+
+
+def srgb_to_acescg(frames_np):
+    frames_lin = srgb_to_linear(frames_np)
+    SRGB_TO_ACES = np.array([
+        [0.59719, 0.35458, 0.04823],
+        [0.07600, 0.90834, 0.01566],
+        [0.02840, 0.13383, 0.83777]
+    ], dtype=np.float32)
+    out_aces = np.einsum("...rc,cd->...rd", frames_lin, SRGB_TO_ACES)
+    return out_aces
+
+def srgb_to_linear(u):
+    mask = (u <= 0.04045)
+    u_out = np.empty_like(u)
+    u_out[mask]  = (u[mask]/12.92)
+    u_out[~mask] = ((u[~mask]+0.055)/1.055)**2.4
+    return u_out
 
 
 #######################################################
@@ -191,7 +318,7 @@ def write_video_ffmpeg(
     preset: str="veryslow"
 ):
     """
-    Codifica frames_list (list of [H,W,3] np.uint8) en un mp4.
+    Encodes 'frames_list' ([H,W,3] np.uint8) into mp4.
     """
     if not frames_list:
         print("[WARN] => No frames => skipping =>", output_path)
@@ -229,6 +356,8 @@ def write_video_ffmpeg(
 #######################################################
 # 5) process_single_video_in_chunks
 #######################################################
+GLOBAL_COLOR_REF = None
+
 def process_single_video_in_chunks(
     pipeline,
     input_video_path,
@@ -238,26 +367,69 @@ def process_single_video_in_chunks(
     tile_num=2,
     color_match=True,
     threshold_mask=0.005,
-    sbs_mode="HSBS",
+    sbs_mode="FSBS",
     encoder="x264",
     origin_mode="2x2",
     left_video_path=None,
     mask_video_path=None,
     warp_video_path=None,
     orig_video_path=None,
-    num_inference_steps=15  # <-- NUEVO
+    num_inference_steps=15,
+    inpaint_output_mode="mp4",
+    color_space="sRGB",
+    fsbs_double_height=True,
+    right_only_1080p=False,
+    downscale_inpainting=True,
+    dilation_mask=2,
+    blur_mask=69,
+    use_color_ref=False,
+    partial_ref_frames=0
 ):
+    """
+    Generates the inpainted right view in chunks. Writes output
+    as mp4 or EXR depending on inpaint_output_mode.
+
+    If color_space="ACEScg", we convert sRGB->ACEScg before writing EXR.
+
+    fsbs_double_height (bool):
+      If True, for FSBS we double final height.
+
+    right_only_1080p (bool):
+      If True, we output ONLY the right eye, but scaled to the
+      same dimension that would be used for HSBS or FSBS, 
+      rather than forcibly 1080 in height.
+
+    downscale_inpainting (bool):
+      If True, warp+mask are downscaled half before pipeline call.
+
+    dilation_mask (int):
+      Number of dilation iterations for the mask.
+
+    blur_mask (int):
+      Size of the Gaussian blur kernel (must be an odd number).
+
+    use_color_ref (bool):
+      If True, tries to apply color reference from the previous chunk's
+      final frame to the new chunk's frames.
+
+    partial_ref_frames (int):
+      If > 0 and use_color_ref=True, only apply color reference to
+      the first N frames of the chunk. The rest frames remain unchanged.
+    """
+
+    global GLOBAL_COLOR_REF
 
     print(f"\n[INFO] => process_single_video_in_chunks => {input_video_path}, origin_mode={origin_mode}")
     os.makedirs(save_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(input_video_path))[0] + "_inpainting_results"
+
     out_temp_path = os.path.join(save_dir, f"{base_name}_temp.mp4")
     final_path = os.path.join(save_dir, f"{base_name}_{sbs_mode}_{encoder}.mp4")
 
     start_init = time.time()
 
     # ---------------------------------------
-    # 1) Leer frames (2x2 o triple)
+    # 1) Read frames (2x2 or triple)
     # ---------------------------------------
     if origin_mode == "2x2":
         vr = VideoReader(input_video_path, ctx=cpu(0))
@@ -298,9 +470,9 @@ def process_single_video_in_chunks(
 
         total_frames = num_frames
         read_mode = "2x2"
-        fps = max(fps, 1.0)  # fallback
+        fps = max(fps, 1.0)
 
-    else:  # origin_mode=="triple"
+    else:  # triple
         vr_left = VideoReader(left_video_path, ctx=cpu(0))
         vr_mask = VideoReader(mask_video_path, ctx=cpu(0))
         vr_warp = VideoReader(warp_video_path, ctx=cpu(0))
@@ -309,7 +481,7 @@ def process_single_video_in_chunks(
         nW = len(vr_warp)
         nF = min(nL, nM, nW)
         if nF == 0:
-            print("[WARN] => triple => one of the videos has 0 frames => skipping.")
+            print("[WARN] => triple => some video has 0 frames => skipping.")
             return None
 
         fps = vr_left.get_avg_fps()
@@ -346,35 +518,41 @@ def process_single_video_in_chunks(
         frames_chunk = total_frames
     stride = max(1, frames_chunk - overlap)
 
-    # Determinar tamaño final SBS
+    # We'll store final_w/final_h just for info
+    final_w, final_h = None, None
     if origin_mode == "2x2":
-        half_h_final = H_in//2
-        half_w_final = W_in//2
+        half_h_final = H_in // 2
+        half_w_final = W_in // 2
         if sbs_mode.upper() == "FSBS":
-            final_w = half_w_final*2
-            final_h = half_h_final
+            if fsbs_double_height:
+                final_w = half_w_final * 2
+                final_h = half_h_final * 2
+            else:
+                final_w = half_w_final * 2
+                final_h = half_h_final
         else:
             final_w = half_w_final
             final_h = half_h_final
-    else:  # triple
+    else:
         if sbs_mode.upper() == "FSBS":
-            final_w = W_in*2
-            final_h = H_in
+            final_w = W_in * 2
+            final_h = H_in * 2 if fsbs_double_height else H_in
         else:
             final_w = W_in
             final_h = H_in
 
     print(f"[INFO] => final SBS resolution = {final_w}x{final_h}")
     final_frames = []
+
     generated_prev = None
+    generated_prev_small = None
 
     dt_init = time.time() - start_init
     report_gpu_mem("after reading")
 
-    # ---------------------------------------
-    # 2) Process frames in chunks
-    # ---------------------------------------
     start_idx = 0
+    chunk_index = 0
+
     while start_idx < total_frames:
         chunk_start_time = time.time()
         end = min(start_idx + frames_chunk, total_frames)
@@ -382,162 +560,361 @@ def process_single_video_in_chunks(
         if csize <= 0:
             break
 
-        print(f"\n[CHUNK] => {start_idx}..{end} (size={csize})")
+        print(f"\n[CHUNK] => {start_idx}..{end} (size={csize}) chunk_index={chunk_index}")
+
         warp_chunk_np = warp_orig_list[start_idx:end]
         mask_chunk_np = mask_orig_list[start_idx:end]
         left_chunk_np = left_orig_list[start_idx:end]
 
-        # Mover a GPU
         warp_t = torch.from_numpy(np.stack(warp_chunk_np, axis=0)).permute(0,3,1,2).float().cuda()
         mask_t = torch.from_numpy(np.stack(mask_chunk_np, axis=0)).permute(0,3,1,2).float().cuda()
         left_t = torch.from_numpy(np.stack(left_chunk_np, axis=0)).permute(0,3,1,2).float().cuda()
 
-        # Máscara en gris
         mask_t = mask_t.mean(dim=1, keepdim=True)
+        mask_np = mask_t.squeeze(1).cpu().numpy()
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+        for i in range(mask_np.shape[0]):
+            mask_uint8 = (mask_np[i] * 255).astype(np.uint8)
+            mask_dil = cv2.dilate(mask_uint8, kernel, iterations=dilation_mask)
+            mask_blurred = cv2.GaussianBlur(mask_dil, (blur_mask, blur_mask), 0)
+            mask_np[i] = mask_blurred.astype(np.float32) / 255.0
 
-        # Overlap temporal
-        if generated_prev is not None and overlap > 0 and start_idx != 0:
-            b1 = generated_prev.shape[0]
-            b2 = warp_t.shape[0]
-            ov_act = min(overlap, b1, b2)
-            if ov_act > 0:
-                print(f"[CHUNK] => Overlap={ov_act} frames from previous chunk")
-                warp_t[:ov_act] = generated_prev[-ov_act:]
+        mask_t = torch.from_numpy(mask_np).unsqueeze(1).to(mask_t.device).float()
 
-        # Si tile_num>1
-        if tile_num > 1:
-            warp_t = pad_for_tiling(warp_t, tile_num=tile_num, tile_overlap=(128,128))
-            mask_t = pad_for_tiling(mask_t, tile_num=tile_num, tile_overlap=(128,128))
+        # PARTIAL color reference => only apply to first partial_ref_frames if desired
+        if use_color_ref and GLOBAL_COLOR_REF is not None and partial_ref_frames > 0:
+            # We'll do color transfer from GLOBAL_COLOR_REF to the first 'partial_ref_frames' frames
+            print(f"[INFO] => Using partial color reference on first {partial_ref_frames} frames...")
 
-        report_gpu_mem("before spatial_tiled_process")
-        t_spatial_start = time.time()
+            global_ref_np = (GLOBAL_COLOR_REF.permute(1,2,0).cpu().numpy()*255).clip(0,255).astype("uint8")
+            warp_np = warp_t.permute(0,2,3,1).cpu().numpy()
 
-        # Llamamos a spatial_tiled_process => num_inference_steps se pasa por kwargs
-        with torch.no_grad():
-            lat_ = spatial_tiled_process(
-                warp_t,
-                mask_t,
-                pipeline,
-                tile_num=tile_num,
-                spatial_n_compress=8,
-                min_guidance_scale=1.01,
-                max_guidance_scale=1.01,
-                decode_chunk_size=8,
-                fps=7,
-                motion_bucket_id=127,
-                noise_aug_strength=0.0,
-                num_inference_steps=num_inference_steps  # <-- NUEVO
+            # Only up to the smaller of partial_ref_frames or the chunk size
+            limit_frames = min(partial_ref_frames, warp_np.shape[0])
+
+            for i_ in range(limit_frames):
+                src_frame = (warp_np[i_]*255).clip(0,255).astype("uint8")
+                matched_ = cm.transfer(src=src_frame, ref=global_ref_np, method='mkl')
+                matched_ = np.clip(matched_, 0, 255).astype("uint8")
+                warp_np[i_] = matched_.astype(np.float32)/255.0
+
+            warp_t = torch.from_numpy(warp_np).permute(0,3,1,2).float().to(warp_t.device)
+        elif use_color_ref and GLOBAL_COLOR_REF is not None:
+            # If partial_ref_frames=0 => apply color to all frames
+            print("[INFO] => Using color reference from previous chunk for all frames...")
+            global_ref_np = (GLOBAL_COLOR_REF.permute(1,2,0).cpu().numpy()*255).clip(0,255).astype("uint8")
+            warp_np = warp_t.permute(0,2,3,1).cpu().numpy()
+            for i_ in range(warp_np.shape[0]):
+                src_frame = (warp_np[i_]*255).clip(0,255).astype("uint8")
+                matched_ = cm.transfer(src=src_frame, ref=global_ref_np, method='mkl')
+                matched_ = np.clip(matched_, 0, 255).astype("uint8")
+                warp_np[i_] = matched_.astype(np.float32)/255.0
+            warp_t = torch.from_numpy(warp_np).permute(0,3,1,2).float().to(warp_t.device)
+
+        if downscale_inpainting:
+            warp_t_small = F.interpolate(warp_t, scale_factor=0.5, mode="bilinear", align_corners=False)
+            mask_t_small = F.interpolate(mask_t, scale_factor=0.5, mode="bilinear", align_corners=False)
+
+            B_small, C_small, H_small, W_small = warp_t_small.shape
+            H_small_aligned = (H_small // 8) * 8
+            W_small_aligned = (W_small // 8) * 8
+            if H_small_aligned < H_small or W_small_aligned < W_small:
+                warp_t_small = warp_t_small[:, :, :H_small_aligned, :W_small_aligned]
+                mask_t_small = mask_t_small[:, :, :H_small_aligned, :W_small_aligned]
+
+            if generated_prev_small is not None and overlap > 0 and start_idx != 0:
+                b1 = generated_prev_small.shape[0]
+                b2 = warp_t_small.shape[0]
+                ov_act = min(overlap, b1, b2)
+                if ov_act > 0:
+                    print(f"[CHUNK] => Overlap={ov_act} frames from previous chunk (downscaled)")
+                    warp_t_small[:ov_act] = generated_prev_small[-ov_act:]
+
+            report_gpu_mem("before spatial_tiled_process (downscaled)")
+            t_spatial_start = time.time()
+
+            with torch.no_grad():
+                lat_ = spatial_tiled_process(
+                    warp_t_small,
+                    mask_t_small,
+                    pipeline,
+                    tile_num=tile_num,
+                    spatial_n_compress=8,
+                    min_guidance_scale=1.01,
+                    max_guidance_scale=1.01,
+                    decode_chunk_size=8,
+                    fps=7,
+                    motion_bucket_id=127,
+                    noise_aug_strength=0.0,
+                    num_inference_steps=num_inference_steps
+                )
+
+            dt_spatial = time.time() - t_spatial_start
+
+            lat_ = lat_.unsqueeze(0)
+            pipeline.vae.to(torch.float16)
+            t_decode_start = time.time()
+            dec = pipeline.decode_latents(lat_, num_frames=lat_.shape[1], decode_chunk_size=1)
+            dec_frames = tensor2vid(dec, pipeline.image_processor, output_type="pil")[0]
+            dt_decode = time.time() - t_decode_start
+
+            out_right_list_small = []
+            for pf in dec_frames:
+                arr = np.array(pf, dtype=np.uint8)
+                t_ = torch.from_numpy(arr).permute(2,0,1).float()/255.0
+                out_right_list_small.append(t_.cuda())
+            right_chunk_small = torch.stack(out_right_list_small, dim=0)
+
+            del lat_, dec, dec_frames, out_right_list_small
+            torch.cuda.empty_cache()
+            report_gpu_mem("after decoding (downscaled)")
+            gc.collect()
+
+            if start_idx != 0 and overlap > 0 and right_chunk_small.shape[0] > overlap:
+                right_chunk_small = right_chunk_small[overlap:]
+
+            Tfin = min(
+                right_chunk_small.shape[0],
+                warp_t.shape[0],
+                mask_t.shape[0],
+                left_t.shape[0]
             )
+            right_chunk_small = right_chunk_small[:Tfin]
+            warp_t = warp_t[-Tfin:]
+            mask_t = mask_t[-Tfin:]
+            left_t = left_t[-Tfin:]
 
-        dt_spatial = time.time() - t_spatial_start
+            print(f"[CHUNK] => Tfinal={Tfin}, upscaling inpainted + blending ...")
 
-        # lat_ => [T, C, H/8, W/8], decodificar
-        lat_ = lat_.unsqueeze(0)  # [1, T, C, H/8, W/8]
+            if overlap > 0 and right_chunk_small.shape[0] >= overlap:
+                generated_prev_small = right_chunk_small[-overlap:].clone()
+            else:
+                generated_prev_small = right_chunk_small.clone()
 
-        pipeline.vae.to(torch.float16)
-        t_decode_start = time.time()
-        dec = pipeline.decode_latents(lat_, num_frames=lat_.shape[1], decode_chunk_size=1)
-        dec_frames = tensor2vid(dec, pipeline.image_processor, output_type="pil")[0]
-        dt_decode = time.time() - t_decode_start
+            right_chunk_up = []
+            for i2 in range(Tfin):
+                rc_small = right_chunk_small[i2].unsqueeze(0)
+                H_orig = warp_t[i2].shape[1]
+                W_orig = warp_t[i2].shape[2]
 
-        # Convertir a tensores float[0..1]
-        out_right_list = []
-        for pf in dec_frames:
-            arr = np.array(pf, dtype=np.uint8)
-            t_ = torch.from_numpy(arr).permute(2,0,1).float()/255.0
-            out_right_list.append(t_.cuda())
-        right_chunk = torch.stack(out_right_list, dim=0)
+                rc_up = F.interpolate(
+                    rc_small,
+                    size=(H_orig, W_orig),
+                    mode="bilinear",
+                    align_corners=False
+                )
+                right_chunk_up.append(rc_up.squeeze(0))
+            right_chunk = torch.stack(right_chunk_up, dim=0)
 
-        del lat_, dec, dec_frames, out_right_list
-        torch.cuda.empty_cache()
-        report_gpu_mem("after decoding")
-        gc.collect()
+        else:
+            if generated_prev is not None and overlap > 0 and start_idx != 0:
+                b1 = generated_prev.shape[0]
+                b2 = warp_t.shape[0]
+                ov_act = min(overlap, b1, b2)
+                if ov_act > 0:
+                    print(f"[CHUNK] => Overlap={ov_act} frames from previous chunk")
+                    warp_t[:ov_act] = generated_prev[-ov_act:]
 
-        # Quitar overlapped frames si no es la primera chunk
-        if start_idx != 0 and overlap > 0:
-            if right_chunk.shape[0] > overlap:
+            report_gpu_mem("before spatial_tiled_process")
+            t_spatial_start = time.time()
+
+            with torch.no_grad():
+                lat_ = spatial_tiled_process(
+                    warp_t,
+                    mask_t,
+                    pipeline,
+                    tile_num=tile_num,
+                    spatial_n_compress=8,
+                    min_guidance_scale=1.01,
+                    max_guidance_scale=1.01,
+                    decode_chunk_size=8,
+                    fps=7,
+                    motion_bucket_id=127,
+                    noise_aug_strength=0.0,
+                    num_inference_steps=num_inference_steps
+                )
+
+            dt_spatial = time.time() - t_spatial_start
+
+            lat_ = lat_.unsqueeze(0)
+            pipeline.vae.to(torch.float16)
+            t_decode_start = time.time()
+            dec = pipeline.decode_latents(lat_, num_frames=lat_.shape[1], decode_chunk_size=1)
+            dec_frames = tensor2vid(dec, pipeline.image_processor, output_type="pil")[0]
+            dt_decode = time.time() - t_decode_start
+
+            out_right_list = []
+            for pf in dec_frames:
+                arr = np.array(pf, dtype=np.uint8)
+                t_ = torch.from_numpy(arr).permute(2,0,1).float()/255.0
+                out_right_list.append(t_.cuda())
+            right_chunk = torch.stack(out_right_list, dim=0)
+
+            del lat_, dec, dec_frames, out_right_list
+            torch.cuda.empty_cache()
+            report_gpu_mem("after decoding")
+            gc.collect()
+
+            if start_idx != 0 and overlap > 0 and right_chunk.shape[0] > overlap:
                 right_chunk = right_chunk[overlap:]
 
-        generated_prev = right_chunk
+            Tfin = min(
+                right_chunk.shape[0],
+                warp_t.shape[0],
+                mask_t.shape[0],
+                left_t.shape[0]
+            )
+            right_chunk = right_chunk[:Tfin]
+            warp_t = warp_t[-Tfin:]
+            mask_t = mask_t[-Tfin:]
+            left_t = left_t[-Tfin:]
 
-        # Ajustar shapes
-        bA = right_chunk.shape[0]
-        if warp_t.shape[0] > bA: warp_t = warp_t[-bA:]
-        if mask_t.shape[0] > bA: mask_t = mask_t[-bA:]
-        if left_t.shape[0] > bA: left_t = left_t[-bA:]
-        Tfin = min(right_chunk.shape[0], warp_t.shape[0], mask_t.shape[0], left_t.shape[0])
-        right_chunk = right_chunk[:Tfin]
-        warp_t      = warp_t[:Tfin]
-        mask_t      = mask_t[:Tfin]
-        left_t      = left_t[:Tfin]
+            print(f"[CHUNK] => Tfinal={Tfin}, blending + recoloring both views...")
 
-        print(f"[CHUNK] => Tfinal={Tfin}, alpha-blend + color matching...")
-        # 1) alpha-blend
+            if overlap > 0 and right_chunk.shape[0] >= overlap:
+                generated_prev = right_chunk[-overlap:].clone()
+            else:
+                generated_prev = right_chunk.clone()
+
         for i2 in range(Tfin):
             inpainted = right_chunk[i2]
-            original  = warp_t[i2]
-            alpha     = (mask_t[i2][0] > threshold_mask).float().unsqueeze(0).repeat(3,1,1)
-            final_    = inpainted*alpha + original*(1 - alpha)
-            right_chunk[i2] = final_
+            original = warp_t[i2]
+            mask_val = mask_t[i2][0].clamp(0, 1)
+            
+            alpha_linear = (mask_val - threshold_mask) / (1.0 - threshold_mask)
+            alpha_linear = alpha_linear.clamp(0, 1)
+            alpha_linear = alpha_linear.pow(0.5)
+            alpha = alpha_linear.unsqueeze(0).repeat(3, 1, 1)
+            
+            inpainted_np = (inpainted.permute(1,2,0).cpu().numpy()*255.0).clip(0,255).astype("uint8")
+            original_np  = (original.permute(1,2,0).cpu().numpy()*255.0).clip(0,255).astype("uint8")
+            orig_recolored_np = cm.transfer(src=original_np, ref=inpainted_np, method='mkl')
+            orig_recolored_np = Normalizer(orig_recolored_np).uint8_norm()
+            orig_recolored_t = (
+                torch.from_numpy(orig_recolored_np)
+                .float()
+                .permute(2,0,1)
+                .to(original.device) / 255.0
+            )
+            final_right = inpainted * alpha + orig_recolored_t * (1 - alpha)
+            final_right = local_color_match_masked_region(final_right, left_t[i2], mask_t[i2], cm)
+            right_chunk[i2] = final_right.clamp(0,1)
 
-        # 2) color-match
-        if color_match:
-            for i2 in range(Tfin):
-                lf = left_t[i2]
-                rf = right_chunk[i2]
-                for c in range(3):
-                    mean_l = lf[c].mean()
-                    std_l  = lf[c].std(unbiased=False) + 1e-6
-                    mean_r = rf[c].mean()
-                    std_r  = rf[c].std(unbiased=False) + 1e-6
-                    rf[c]  = (rf[c] - mean_r)/std_r
-                    rf[c]  = rf[c]*std_l + mean_l
-                rf.clamp_(0, 1)
-
-        # 3) re-scale
+        # 3) Upscale right if needed
         up_right = []
         for i2 in range(Tfin):
             rc = right_chunk[i2].unsqueeze(0)
             if origin_mode == "2x2":
-                rc_up = F.interpolate(rc, size=(H_in//2, W_in//2), mode="bilinear", align_corners=False)
+                if sbs_mode.upper() == "HSBS":
+                    rc_up = F.interpolate(
+                        rc,
+                        size=(half_h_in, half_w_in // 2),
+                        mode="bilinear",
+                        align_corners=False
+                    )
+                elif sbs_mode.upper() == "FSBS":
+                    if fsbs_double_height:
+                        rc_up = F.interpolate(
+                            rc,
+                            size=(2 * half_h_in, half_w_in),
+                            mode="bilinear",
+                            align_corners=False
+                        )
+                    else:
+                        rc_up = F.interpolate(
+                            rc,
+                            size=(half_h_in, half_w_in),
+                            mode="bilinear",
+                            align_corners=False
+                        )
+                else:
+                    rc_up = F.interpolate(
+                        rc,
+                        size=(half_h_in, half_w_in // 2),
+                        mode="bilinear",
+                        align_corners=False
+                    )
             else:
-                rc_up = F.interpolate(rc, size=(H_in, W_in), mode="bilinear", align_corners=False)
+                if sbs_mode.upper() == "HSBS":
+                    rc_up = F.interpolate(rc, size=(H_in, W_in//2), mode="bilinear", align_corners=False)
+                elif sbs_mode.upper() == "FSBS":
+                    if fsbs_double_height:
+                        rc_up = F.interpolate(rc, size=(H_in*2, W_in), mode="bilinear", align_corners=False)
+                    else:
+                        rc_up = F.interpolate(rc, size=(H_in, W_in), mode="bilinear", align_corners=False)
+                else:
+                    rc_up = F.interpolate(rc, size=(H_in, W_in//2), mode="bilinear", align_corners=False)
             up_right.append(rc_up.squeeze(0))
+
         up_right_t = torch.stack(up_right, dim=0)
 
-        # 4) Compose SBS
-        for i2 in range(Tfin):
-            lf_1 = left_t[i2].unsqueeze(0)
-            if origin_mode == "2x2":
-                lf_up = F.interpolate(lf_1, size=(H_in//2, W_in//2), mode="bilinear", align_corners=False)
-            else:
-                lf_up = F.interpolate(lf_1, size=(H_in, W_in), mode="bilinear", align_corners=False)
-            lf_up = lf_up.squeeze(0)
+        if right_only_1080p:
+            final_right_only_list = []
+            for i2 in range(Tfin):
+                rc_ = up_right_t[i2].unsqueeze(0).clamp(0,1)
+                rc_upsized = F.interpolate(rc_, scale_factor=(1,2), mode="bilinear", align_corners=False)
+                rc_cpu = rc_upsized.squeeze(0).detach().cpu()
+                rc_uint8 = (rc_cpu*255).byte().permute(1,2,0).numpy()
+                final_right_only_list.append(rc_uint8)
+            final_frames.extend(final_right_only_list)
 
-            rf_t = up_right_t[i2]
+        else:
+            for i2 in range(Tfin):
+                lf_1 = left_t[i2].unsqueeze(0)
+                if origin_mode == "2x2":
+                    if sbs_mode.upper() == "HSBS":
+                        lf_up = F.interpolate(
+                            lf_1,
+                            size=(half_h_in, half_w_in // 2),
+                            mode="bilinear",
+                            align_corners=False
+                        )
+                    elif sbs_mode.upper() == "FSBS":
+                        if fsbs_double_height:
+                            lf_up = F.interpolate(
+                                lf_1,
+                                size=(2 * half_h_in, half_w_in),
+                                mode="bilinear",
+                                align_corners=False
+                            )
+                        else:
+                            lf_up = F.interpolate(
+                                lf_1,
+                                size=(half_h_in, half_w_in),
+                                mode="bilinear",
+                                align_corners=False
+                            )
+                    else:
+                        lf_up = F.interpolate(
+                            lf_1,
+                            size=(half_h_in, half_w_in // 2),
+                            mode="bilinear",
+                            align_corners=False
+                        )
+                else:
+                    if sbs_mode.upper() == "HSBS":
+                        lf_up = F.interpolate(lf_1, size=(H_in, W_in//2), mode="bilinear", align_corners=False)
+                    elif sbs_mode.upper() == "FSBS":
+                        if fsbs_double_height:
+                            lf_up = F.interpolate(lf_1, size=(H_in*2, W_in), mode="bilinear", align_corners=False)
+                        else:
+                            lf_up = F.interpolate(lf_1, size=(H_in, W_in), mode="bilinear", align_corners=False)
+                    else:
+                        lf_up = F.interpolate(lf_1, size=(H_in, W_in//2), mode="bilinear", align_corners=False)
 
-            if sbs_mode.upper() == "FSBS":
+                lf_up = lf_up.squeeze(0)
+                rf_t = up_right_t[i2]
                 sbs = torch.cat([lf_up, rf_t], dim=2)
-            else:
-                half_w_l = lf_up.shape[2] // 2
-                half_w_r = rf_t.shape[2] // 2
-                lf_small = F.interpolate(
-                    lf_up.unsqueeze(0),
-                    size=(lf_up.shape[1], half_w_l),
-                    mode="bilinear", align_corners=False
-                ).squeeze(0)
-                rf_small = F.interpolate(
-                    rf_t.unsqueeze(0),
-                    size=(rf_t.shape[1], half_w_r),
-                    mode="bilinear", align_corners=False
-                ).squeeze(0)
-                sbs = torch.cat([lf_small, rf_small], dim=2)
 
-            sbs_cpu = sbs.detach().cpu().clamp(0,1)
-            sbs_uint8 = (sbs_cpu*255).byte().permute(1,2,0).numpy()
-            final_frames.append(sbs_uint8)
+                sbs_cpu = sbs.detach().cpu().clamp(0,1)
+                sbs_uint8 = (sbs_cpu*255).byte().permute(1,2,0).numpy()
+                final_frames.append(sbs_uint8)
 
-        # Limpieza chunk
+        # Optionally store the last frame's color reference
+        if use_color_ref and len(up_right_t) > 0:
+            last_ = up_right_t[-1].clone()
+            GLOBAL_COLOR_REF = last_
+
         del warp_t, mask_t, left_t, right_chunk, up_right_t, up_right
         torch.cuda.empty_cache()
         gc.collect()
@@ -545,90 +922,94 @@ def process_single_video_in_chunks(
         chunk_dt = time.time() - chunk_start_time
         print(f"[CHUNK] => Finished chunk in {chunk_dt:.2f}s")
         report_gpu_mem("after chunk")
+
         start_idx += stride
+        chunk_index += 1
 
     # ---------------------------------------
-    # 3) Escribir video SBS final (sin audio)
+    # 3) Write final (MP4 or EXR)
     # ---------------------------------------
     if not final_frames:
         print("[WARN] => No frames => skipping =>", out_temp_path)
         return None
 
-    print(f"[INFO] => Encoding final video => {out_temp_path}")
-    frames_np = np.stack(final_frames, axis=0)
-    frames_np = np.ascontiguousarray(frames_np)
-    import imageio_ffmpeg
-    crf = 0 if encoder=="x264" else 0
-    cdc = "libx265" if encoder=="x265" else "libx264"
-    cmd_params = [
-        "-crf", str(crf),
-        "-preset", "veryslow"
-    ]
-    writer = imageio_ffmpeg.write_frames(
-        out_temp_path,
-        (frames_np.shape[2], frames_np.shape[1]),
-        fps=fps,
-        codec=cdc,
-        output_params=cmd_params
-    )
-    writer.send(None)
-    for i in range(frames_np.shape[0]):
-        writer.send(frames_np[i])
-    writer.close()
+    if inpaint_output_mode == "mp4":
+        print(f"[INFO] => Writing MP4 => {out_temp_path}")
+        frames_np = np.stack(final_frames, axis=0)
+        frames_np = np.ascontiguousarray(frames_np)
+        crf = 0 if encoder=="x264" else 0
+        cdc = "libx265" if encoder=="x265" else "libx264"
+        cmd_params = ["-crf", str(crf), "-preset", "veryslow"]
 
-    final_frames.clear()
+        writer = imageio_ffmpeg.write_frames(
+            out_temp_path,
+            (frames_np.shape[2], frames_np.shape[1]),
+            fps=fps,
+            codec=cdc,
+            output_params=cmd_params
+        )
+        writer.send(None)
+        for i in range(frames_np.shape[0]):
+            writer.send(frames_np[i])
+        writer.close()
 
-    if not os.path.exists(out_temp_path):
-        print("[WARN] => No temp file => no final =>", out_temp_path)
-        return None
-    # ---------------------------------------
-    # 4) Mux audio (si orig_video_path existe)
-    # ---------------------------------------
-    import imageio_ffmpeg  # Asegúrate de que esté instalado: pip install imageio-ffmpeg
+        final_frames.clear()
 
-    if orig_video_path and os.path.isfile(orig_video_path):
-        print(f"[AUDIO] => Found orig video => {orig_video_path}, muxing audio into final SBS...")
-        temp_withaudio = os.path.join(save_dir, f"{base_name}_temp_withaudio.mp4")
-        
-        # Obtenemos la ruta absoluta de ffmpeg que maneja imageio
-        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        if not os.path.exists(out_temp_path):
+            print("[WARN] => No temp file => no final =>", out_temp_path)
+            return None
 
-        cmd_mux = [
-            ffmpeg_path,  # <--- Usamos la ruta completa a ffmpeg
-            "-y",
-            "-i", out_temp_path,   # SBS sin audio
-            "-i", orig_video_path, # audio original
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-shortest",
-            temp_withaudio
-        ]
-        print("[AUDIO] =>", " ".join(cmd_mux))
-        
-    try:
-        subprocess.run(cmd_mux, check=True)
-        if os.path.exists(temp_withaudio):
-            shutil.move(temp_withaudio, final_path)
-
-            # Esperamos un poco antes de borrar el archivo temporal de vídeo
-        
-            time.sleep(0.5)
-
-            # Ahora intentamos eliminarlo
-            os.remove(out_temp_path)
-            print("[AUDIO] => done =>", final_path)
-            return final_path
+        final_path = os.path.join(save_dir, f"{base_name}_{sbs_mode}_{encoder}.mp4")
+        if orig_video_path and os.path.isfile(orig_video_path):
+            print(f"[AUDIO] => Found orig => {orig_video_path}, muxing ...")
+            temp_withaudio = os.path.join(save_dir, f"{base_name}_temp_withaudio.mp4")
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            cmd_mux = [
+                ffmpeg_path, "-y",
+                "-i", out_temp_path,
+                "-i", orig_video_path,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-shortest",
+                temp_withaudio
+            ]
+            print("[AUDIO] =>", " ".join(cmd_mux))
+            try:
+                subprocess.run(cmd_mux, check=True)
+                if os.path.exists(temp_withaudio):
+                    shutil.move(temp_withaudio, final_path)
+                    time.sleep(0.5)
+                    os.remove(out_temp_path)
+                    print("[AUDIO] => done =>", final_path)
+                    return final_path
+                else:
+                    print("[AUDIO] => fallback => no temp_withaudio => no audio.")
+                    shutil.move(out_temp_path, final_path)
+                    return final_path
+            except subprocess.CalledProcessError as e:
+                print("[AUDIO] => error =>", e)
+                shutil.move(out_temp_path, final_path)
+                return final_path
         else:
-            print("[AUDIO] => failed => no temp_withaudio => fallback => no audio")
             shutil.move(out_temp_path, final_path)
             return final_path
-    except subprocess.CalledProcessError as e:
-        print("[AUDIO] => error =>", e)
-        shutil.move(out_temp_path, final_path)
-        return final_path
 
+    else:
+        print("[INFO] => Writing EXR =>", inpaint_output_mode)
+        frames_np = np.stack(final_frames, axis=0).astype(np.float32)/255.0
+        final_frames.clear()
+
+        if color_space == "ACEScg":
+            frames_np = srgb_to_acescg(frames_np)
+
+        out_exr_dir = os.path.join(save_dir, f"{base_name}_exrseq_{sbs_mode}")
+        half_f = (inpaint_output_mode=="exr16")
+        save_exr_sequence_color(frames_np, out_exr_dir, half_float=half_f)
+
+        print(f"[OK] => EXR seq => {out_exr_dir}")
+        return out_exr_dir
 
 
 #######################################################
@@ -646,19 +1027,33 @@ def batch_process(
     concat_final=False,
     single_video=None,
     threshold_mask=0.008,
-    sbs_mode="HSBS",
+    sbs_mode="FSBS",
     encoder="x264",
     origin_mode="",
+    inpaint_output_mode="mp4",
+    color_space="sRGB", 
     left_video_path=None,
     mask_video_path=None,
     warp_video_path=None,
-    orig_video=None,         # <-- para inyectar audio
-    num_inference_steps=10   
+    orig_video=None,
+    num_inference_steps=10,
+    fsbs_double_height=True,
+    right_only_1080p=False,
+    downscale_inpainting=True,
+    dilation_mask=2,
+    blur_mask=69,
+    use_color_ref=False,
+    partial_ref_frames=0
 ):
+    """
+    Main batch process entry point.
+      - use_color_ref (bool): If True, pass color reference from chunk to chunk
+      - partial_ref_frames (int): If > 0, only apply that color ref to the first N frames
+        of each chunk. The rest remain as is, which can help fade transitions.
+    """
 
     print("[INFO] => batch_process => Loading pipeline...")
 
-    # Cargar pipeline
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(
         pre_trained_path,
         subfolder="image_encoder",
@@ -691,7 +1086,6 @@ def batch_process(
 
     os.makedirs(output_folder, exist_ok=True)
 
-    # Seleccionar qué videos procesar
     if single_video and os.path.isfile(single_video):
         single_video = os.path.normpath(os.path.abspath(single_video))
         input_videos = [single_video]
@@ -706,7 +1100,6 @@ def batch_process(
             print("[INFO] => No videos found in =>", input_folder)
             return
 
-    # Auto-detect origin_mode si no se pasa
     if not origin_mode:
         if single_video:
             base_ = os.path.basename(single_video)
@@ -747,21 +1140,29 @@ def batch_process(
             tile_num=tile_num,
             color_match=color_match,
             threshold_mask=threshold_mask,
+            inpaint_output_mode=inpaint_output_mode,
             sbs_mode=sbs_mode,
+            color_space=color_space,
             encoder=encoder,
             origin_mode="triple",
             left_video_path=left_video_path,
             mask_video_path=mask_video_path,
             warp_video_path=warp_video_path,
-            orig_video_path=orig_video,         # <-- pass audio source
-            num_inference_steps=num_inference_steps  
+            orig_video_path=orig_video,
+            num_inference_steps=num_inference_steps,
+            fsbs_double_height=fsbs_double_height,
+            right_only_1080p=right_only_1080p,
+            downscale_inpainting=downscale_inpainting,
+            dilation_mask=dilation_mask,
+            blur_mask=blur_mask,
+            use_color_ref=use_color_ref,
+            partial_ref_frames=partial_ref_frames
         )
         if outp:
             processed.append(outp)
     elif origin_mode == "triple" and not single_video:
         print("[WARN] => origin_mode=triple => no single_video => not implemented in this example.")
     else:
-        # 2x2 mode
         for vid in input_videos:
             print(f"\n[INFO] => Processing => {vid}")
             outp = process_single_video_in_chunks(
@@ -774,24 +1175,32 @@ def batch_process(
                 color_match=color_match,
                 threshold_mask=threshold_mask,
                 sbs_mode=sbs_mode,
+                inpaint_output_mode=inpaint_output_mode,
+                color_space=color_space,
                 encoder=encoder,
                 origin_mode="2x2",
-                orig_video_path=orig_video,         # <-- pass audio source
-                num_inference_steps=num_inference_steps 
+                orig_video_path=orig_video,
+                num_inference_steps=num_inference_steps,
+                fsbs_double_height=fsbs_double_height,
+                right_only_1080p=right_only_1080p,
+                downscale_inpainting=downscale_inpainting,
+                dilation_mask=dilation_mask,
+                blur_mask=blur_mask,
+                use_color_ref=use_color_ref,
+                partial_ref_frames=partial_ref_frames
             )
             if outp:
                 processed.append(outp)
             torch.cuda.empty_cache()
             gc.collect()
 
-    # Concat final si se pide
     if concat_final and processed:
         merged_name = os.path.join(output_folder, "final_merged.mp4")
         list_txt = os.path.join(output_folder, "mylist.txt")
         with open(list_txt, "w", encoding="utf-8") as ff:
             for p_ in processed:
                 ff.write(f"file '{os.path.abspath(p_)}'\n")
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()        
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [
             "ffmpeg_exe", "-y", "-f", "concat", "-safe", "0",
             "-i", list_txt,
@@ -802,7 +1211,6 @@ def batch_process(
         subprocess.run(cmd, check=True)
         print("[INFO] => Final merged =>", merged_name)
 
-    # Cleanup pipeline
     pipeline.unet.to(torch.float32)
     pipeline.vae.to(torch.float32)
     pipeline.image_encoder.to(torch.float32)

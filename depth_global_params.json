@@ -1,16 +1,19 @@
 {
   "crafter_overlap": 25,
   "crafter_window": 70,
-  "crafter_maxres_value": 768,
+  "crafter_maxres_value": 512,
   "crafter_denoising_steps": 8,
   "crafter_guidance_scale": 1.2,
   "crafter_seed": 42,
-  "vda_maxres_value": 1024,
+  "vda_maxres_value": 512,
   "vda_use_fp16": true,
   "vda_use_cudnn": true,
   "vda_input_size": 512,
   "vda_encoder": "vitl",
-  "inpaint_threshold_batch": 0.02000000000000001,
-  "sbs_mode": "HSBS",
-  "output_encoder": "x264"
+  "inpaint_threshold_batch": 0.001,
+  "sbs_mode": "FSBS",
+  "output_encoder": "X264",
+  "depth_output_mode": "8-bit MP4",
+  "inpaint_output_mode": "8-bit MP4",
+  "color_space_output": "sRGB"
 }

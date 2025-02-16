@@ -34,3 +34,5 @@ wheel
 ninja
 scenedetect
 color-matcher
+OpenEXR
+Imath

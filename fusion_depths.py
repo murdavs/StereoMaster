@@ -169,6 +169,5 @@ if __name__=="__main__":
          dilate_h=args.dilate_h,
          dilate_v=args.dilate_v,
          blur_ksize=args.blur_ksize,
-         blur_sigma=args.blur_sigma,
-         window_size=args.window_size,
-         overlap=args.overlap)
+         blur_sigma=args.blur_sigma)
+       

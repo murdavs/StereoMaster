@@ -5,6 +5,13 @@
 - [Video Depth Anything](https://huggingface.co/depth-anything/Video-Depth-Anything)  
 - [StereoCrafter](https://huggingface.co/TencentARC/StereoCrafter)
 
+
+## 📣 News
+- `2025/02/09` Initial commit.
+- `2025/02/16` Update: Added downscale inpainting, anaglyph file merging, enhanced partial frames, improved StereoCrafter (mask dilation, blur, configurable chunking), refined color matcher (fixed preview vs. SBS mismatch), new outputs (4KHSBS, Right-Only, EXR export), plus various bug fixes.
+
+
+
 ## Features
 
 - **Depth map generation** using DepthCrafter or Video Depth Anything.
