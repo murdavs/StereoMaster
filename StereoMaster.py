@@ -2491,13 +2491,14 @@ class StereoMasterGUI(QMainWindow):
         cmd = [
             sys.executable, "-m", "scenedetect",
             "-i", video_path_abs,
-            "-o", self.dir_input_videos,  # Carpeta de salida
+            "-o", self.dir_input_videos,
             "detect-content",
             "-t", threshold,
             "split-video",
-            "--preset", "h264",
-            "--args=-c:v libx264 -preset slower -crf 0 -c:a copy"
+            "--preset", "slower",  # Uno de los permitidos: ultrafast, superfast, etc.
+            "--args=-c:v libx264 -crf 0 -c:a copy"
         ]
+
 
         self.log(f"[INFO] => scenedetect => {cmd}")
 
@@ -2832,7 +2833,7 @@ class StereoMasterGUI(QMainWindow):
             self.brightness_value = vp.get("brightness_value", 1.0)
             self.gamma_value = vp.get("gamma_value", 1.0)
             self.dilate_h_value = vp.get("dilate_h_value", 4)
-            self.dilate_v_value = vp.get("dilate_v_value", 2)
+            self.dilate_v_value = vp.get("dilate_v_value", 1)
             self.blur_ksize_value = vp.get("blur_ksize_value", 3)
             self.blur_sigma_value = vp.get("blur_sigma_value", 2.0)
             self.warp_exponent_base = vp.get("warp_exponent_base", 1.414)
@@ -3282,7 +3283,11 @@ class StereoMasterGUI(QMainWindow):
         self.log(f"[OUTPUT] => SBS Mode changed to {self.sbs_mode}")
 
     def on_encoder_changed(self, index):
+    
+        selected_encoder = self.combo_encoder.currentText()   
+        self.output_encoder = selected_encoder
         self.log(f"[OUTPUT] => Encoder changed to {self.output_encoder}")
+        self.save_depth_global_params()
 
 
     def do_scene_detect_with_threshold(self, threshold, video_path=None):
@@ -3318,8 +3323,8 @@ class StereoMasterGUI(QMainWindow):
             "detect-content",
             "-t", str(threshold),
             "split-video",
-            "--preset", "h264",
-            "--args=-c:v libx264 -preset slower -crf 0 -c:a copy"
+            "--preset", "slower", 
+            "--args=-c:v libx264 -crf 0 -c:a copy"
         ]
 
         self.log("[INFO] => scenedetect => " + " ".join(cmd))

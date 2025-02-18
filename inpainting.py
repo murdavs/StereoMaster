@@ -937,9 +937,12 @@ def process_single_video_in_chunks(
         print(f"[INFO] => Writing MP4 => {out_temp_path}")
         frames_np = np.stack(final_frames, axis=0)
         frames_np = np.ascontiguousarray(frames_np)
-        crf = 0 if encoder=="x264" else 0
+        if encoder == "x264":
+            crf = 0  
+        elif encoder == "x265":
+            crf = 14
         cdc = "libx265" if encoder=="x265" else "libx264"
-        cmd_params = ["-crf", str(crf), "-preset", "veryslow"]
+        cmd_params = ["-crf", str(crf), "-preset", "slow"]
 
         writer = imageio_ffmpeg.write_frames(
             out_temp_path,
