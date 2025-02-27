@@ -9,7 +9,7 @@
 ## 📣 News
 - `2025/02/09` Initial commit.
 - `2025/02/16` Update: Added downscale inpainting, anaglyph file merging, enhanced partial frames, improved StereoCrafter (mask dilation, blur, configurable chunking), refined color matcher (fixed preview vs. SBS mismatch), new outputs (4KHSBS, Right-Only, EXR export), plus various bug fixes.
-
+- `2025/02/28` Early Blackwell support, improved color matching in inpainting, new mixed inpainting system, fixed missing frames and repeated frames at the end of each chunk, UI/UX enhancements, VDA split fix for batch_size, and improved installation process.
 
 
 ## Features
@@ -26,12 +26,21 @@
 ## System Requirements
 
 - **OS:** Windows 10/11 (64-bit)  
-- **GPU:** NVIDIA (RTX 3000/4000 series or newer)  
-  - **Required VRAM:** 12 GB (16 GB recommended)  
-- **CUDA:** 12.6 (older versions will not work)  
+- **GPU:** NVIDIA (RTX 3000/4000/*5000*)  
+  - **Required VRAM:** 12 GB (16 GB recommended)   
 - **Python:** 3.12  
-- **Visual Studio Build Tools:** 2019 or 2022 (MSVC 14.36 - 14.40)  
 - **Git:** Required for dependency management  
+
+
+## Two Versions of Requirements
+
+1. **CUDA 12.6 (Stable)**  
+   - Use `requirements_cu126.txt` for standard RTX GPUs.  
+   - Torch versions are stable releases.
+
+2. **CUDA 12.8 (Nightly) for Blackwell**  
+   - Use `requirements_cu128.txt` if you want to run on the latest NVIDIA Blackwell (RTX 5000 series).  
+   - Torch is installed from nightly builds; there is no official xformers wheel yet.
 
 ---
 
@@ -83,92 +92,8 @@ Ensure it points to the real Python installation
 
 ---
 
-### 3. Install Visual Studio Build Tools
 
-1. Download from:  
-   [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-
-2. Run the installer and select:
-    - C++ CMake tools for Windows  
-    - Windows 10/11 SDK    
-    - MSVC v143 - VS 2022 C++ x64/x86 (14.40-17.10)  
-	- C++ compilation tools for MSVC v143-VS 2022 for x64/x86 (latest)
-    - Spectre-mitigated libraries for MSVC v143 – VS 2022 C++ x64/x86 (v14.40–17.10) 
-
-   *(If you don’t see these options, check **Individual Components**.)*
-
-
----
-
-### 4. Install CUDA 12.6 & cuDNN
-
-1. Download CUDA 12.6 (local `.exe`) from:  
-   [NVIDIA CUDA 12.6.3 Downloads](https://developer.nvidia.com/cuda-12-6-3-download-archive?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local)
-
-2. On the website, select:
-    - Operating System: Windows  
-    - Architecture: x86_64  
-    - Version: Windows 10/11  
-    - Installer Type: exe (local)
-
-3. Run the installer, **check**:
-    - CUDA Toolkit  
-    - CUDA Runtime  
-    - NVCC Compiler  
-
-4. Restart your PC.
-
-**Verify CUDA** by running:
-
-    nvcc --version
-
-Expected output:
-
-    release 12.6, V12.6.3
-
----
-
-### 5. Configure Environment Variables
-
-1. Open **CMD as Administrator** (Win + R → type `cmd` → press **Ctrl + Shift + Enter**).
-
-2. Run these commands:
-
-    ```
-    setx DISTUTILS_USE_SDK "1" /M
-    setx USE_CUDA "1" /M
-    setx CMAKE_GENERATOR "Visual Studio 17 2022" /M
-    setx CMAKE_GENERATOR_PLATFORM "x64" /M
-    setx PATH "%PATH%;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin" /M
-    setx CUDA_HOME "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6" /M
-    ```
-
-3. Activate the correct Visual Studio compiler:
-
-   **For VS 2022 Build Tools**:
-
-       "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
-
-   **For VS 2019 Build Tools**:
-
-       "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
-	   
-	Verify running:
-
-    ```	
-    cl	
-    ```
-    
-	You should see something like:
-   
-    ```
-    Microsoft (R) C/C++ Optimizing Compiler Version 19.36.32530 for x64
-	
-	```
-
----
-
-### 6. Install Git
+### 3. Install Git
 
 1. Download from:  
    [Git for Windows](https://git-scm.com/download/win)
@@ -179,7 +104,7 @@ Expected output:
 ---	
 
 
-### 7. Clone the StereoMaster Repository
+### 4. Clone the StereoMaster Repository
 
     cd C:\
     git clone https://github.com/murdavs/StereoMaster.git
@@ -187,7 +112,7 @@ Expected output:
 
 ---
 
-### 8. Create a Virtual Environment & Install Dependencies
+### 5. Create a Virtual Environment & Install Dependencies
 
 1. Create a new virtual environment:
 
@@ -202,9 +127,20 @@ Expected output:
        pip install --upgrade pip setuptools wheel
 
 
-4. Install other dependencies:
+4.  **Choose** the requirements file you need:
 
-       pip install --use-pep517 --no-cache-dir -r requirements.txt
+- For standard (CUDA 12.6 stable):  
+  ```
+  pip install --use-pep517 --no-cache-dir -r requirements_cu126.txt
+  ```
+
+- For Blackwell (CUDA 12.8 nightly):  
+  ```
+  pip install --use-pep517 --no-cache-dir -r requirements_cu128.txt
+  ```
+
+(Torch with CUDA 12.8 is installed from nightly builds, and xformers is not yet available for that combination.)
+
 
 **Verify PyTorch & CUDA**:
 
@@ -217,39 +153,8 @@ Expected:
 
 ---
 
-### 9. Install Triton (Updated for Python 3.12)
 
-1. Navigate to the `assets` folder:
-
-       cd assets
-
-2. Install the Triton wheel:
-
-       pip install triton-3.1.0-cp312-cp312-win_amd64.whl
-
----
-
-### 10. Compile Forward Warp
-
-1. Go to the Forward-Warp folder:
-
-       cd ..\dependency\Forward-Warp\
-
-2. Clean and install:
-
-       python setup.py clean
-       pip install .
-
-3. Enter the `cuda` folder, then clean and install again:
-
-       cd Forward-Warp\cuda
-       python setup.py clean
-       pip install .
-
----
-
-
-### 11. Login in Hugging Face CLI & Download Model Weights
+### 6. Login in Hugging Face CLI & Download Model Weights
 
 1. Login in Hugging Face CLI:
 
@@ -296,22 +201,6 @@ After **all steps** are completed:
 4. **Alternatively**, **double-click**:
    **`Launch StereoMaster.bat`** (in the root directory) to launch automatically.
 
----
-
-## Forward Warp CUDA Extension Installation Troubleshooting (Windows)
-
-1. **Check Microsoft Visual C++ Build Tools Installation**  
-   - Make sure that all the packages listed in step 3 are installed with the specified versions.
-   - This ensures `cl.exe` and associated tools are available.
-
-2. **Open the Correct Developer Command Prompt**  
-   - Run the following command before running the Forward-Warp CUDA installation script to configure the environment for 64-bit builds:
-     ```
-     "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
-     ```
-   - This ensures that the compiler (`cl.exe`) is on your PATH and recognized.
-   
-   
 ---
 
 ## Ko-fi Support

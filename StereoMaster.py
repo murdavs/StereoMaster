@@ -39,165 +39,6 @@ except Exception as e:
     print("Could not set AppUserModelID:", e)
     
     
-@njit(parallel=True)
-def apply_stereo_divergence_polylines(
-    original_image, 
-    normalized_depth,
-    divergence_px: float,
-    separation_px: float,
-    stereo_offset_exponent: float,
-    fill_technique: str
-):
-    """
-    This code treats each row of 'original_image' as a polyline. It applies a
-    horizontal offset to each pixel based on the depth (normalized_depth) and
-    some exponent. The result is a stereo-shifted image with no holes.
-
-    original_image => [H, W, 3], uint8  (LEFT)
-    normalized_depth => [H, W], in [0..1]
-    divergence_px => maximum horizontal shift (pixels) for depth=1
-    separation_px => additional constant separation (pixels)
-    stereo_offset_exponent => exponent for depth scaling
-    fill_technique => 'polylines' or 'polylines_sharp' => 
-                      si 'polylines_sharp', desplazamos medio pixel extra.
-    Returns derived_image => [H, W, 3], uint8 (RIGHT)
-    """
-    EPSILON = 1e-7
-    PIXEL_HALF_WIDTH = 0.45 if fill_technique == 'polylines_sharp' else 0.0
-
-    h, w, c = original_image.shape
-    derived_image = np.zeros_like(original_image)
-
-    for row in prange(h):
-        pt = np.zeros((5 + 2*w, 3), dtype=np.float64)
-        pt_end = 0
-
-   
-        pt[pt_end] = [-1.0*w, 0.0, 0.0]
-        pt_end += 1
-
-        for col in range(w):
-            d_val = normalized_depth[row, col]
-            coord_d = -(d_val**stereo_offset_exponent)* divergence_px
-            coord_x = col + 0.5 + coord_d - separation_px
-
-            if PIXEL_HALF_WIDTH < EPSILON:
-                pt[pt_end] = [coord_x, abs(coord_d), col]
-                pt_end += 1
-            else:
-                pt[pt_end]   = [coord_x - PIXEL_HALF_WIDTH, abs(coord_d), col]
-                pt[pt_end+1] = [coord_x + PIXEL_HALF_WIDTH, abs(coord_d), col]
-                pt_end += 2
-
-     
-        pt[pt_end] = [2.0*w, 0.0, w-1]
-        pt_end += 1
-
-  
-        sg_end = pt_end - 1
-        sg = np.zeros((sg_end, 6), dtype=np.float64)
-        for i in range(sg_end):
-            sg[i, 0] = pt[i, 0]
-            sg[i, 1] = pt[i, 1]
-            sg[i, 2] = pt[i, 2]
-            sg[i, 3] = pt[i+1, 0]
-            sg[i, 4] = pt[i+1, 1]
-            sg[i, 5] = pt[i+1, 2]
-
-      
-        for i in range(1, sg_end):
-            j = i - 1
-            key_pt = pt[i].copy()
-            key_sg = sg[i].copy()
-            while j >= 0 and pt[j,0] > key_pt[0]:
-                pt[j+1] = pt[j]
-                sg[j+1] = sg[j]
-                j -= 1
-            pt[j+1] = key_pt
-            sg[j+1] = key_sg
-
-        
-        csg = np.zeros((5*(int(abs(divergence_px))+5), 6), dtype=np.float64)
-        csg_end = 0
-        sg_pointer = 0
-        pt_i = 0
-
-        for col in range(w):
-            color_mix = np.zeros(c, dtype=np.float64)
-
-            while pt[pt_i,0] < col:
-                pt_i += 1
-                if pt_i>= pt_end-1:
-                    break
-            pt_i -= 1
-            if pt_i<0:
-                pt_i=0
-
-            while pt[pt_i,0] < col+1.0:
-                coord_from = max(col, pt[pt_i,0]) + EPSILON
-                coord_to   = min(col+1.0, pt[pt_i+1,0]) - EPSILON
-                if coord_to < coord_from:
-                    pt_i += 1
-                    if pt_i>= pt_end-1:
-                        break
-                    continue
-
-                significance = coord_to - coord_from
-                coord_center = coord_from + 0.5* significance
-
-         
-                while sg_pointer< sg_end and sg[sg_pointer,0] < coord_center:
-                    csg[csg_end] = sg[sg_pointer]
-                    csg_end += 1
-                    sg_pointer += 1
-
-               
-                csg_i = 0
-                while csg_i< csg_end:
-                    if csg[csg_i,3] < coord_center:
-                        csg[csg_i] = csg[csg_end-1]
-                        csg_end-=1
-                    else:
-                        csg_i+=1
-
-                
-                best_idx= 0
-                best_cl = -999999.0
-                for csg_i in range(csg_end):
-                    denom= (csg[csg_i,3] - csg[csg_i,0])
-                    if abs(denom)< EPSILON:
-                        continue
-                    ip_k= (coord_center - csg[csg_i,0])/ denom
-                    if ip_k<0.0 or ip_k>1.0:
-                        continue
-                    closeness= (1.0-ip_k)* csg[csg_i,1] + ip_k* csg[csg_i,4]
-                    if closeness> best_cl:
-                        best_cl = closeness
-                        best_idx= csg_i
-
-          
-                col_l = int(csg[best_idx,2])
-                col_r = int(csg[best_idx,5])
-
-                if col_l== col_r:
-                    color_mix += original_image[row, col_l]* significance
-                else:
-                    denom2= (csg[best_idx,3] - csg[best_idx,0])
-                    if abs(denom2)< EPSILON:
-                        color_mix += original_image[row, col_l]* significance
-                    else:
-                        ip_k2= (coord_center - csg[best_idx,0])/ denom2
-                        color_mix += (original_image[row, col_l]*(1.0- ip_k2) +
-                                      original_image[row, col_r]* ip_k2)* significance
-
-                pt_i+=1
-                if pt_i>= pt_end-1:
-                    break
-
-            derived_image[row, col] = np.clip(color_mix, 0,255).astype(np.uint8)
-
-    return derived_image
-
 ###########################################################
 # (A) Subclass QSlider with ticks for keyframes + richer tooltip
 ###########################################################
@@ -228,22 +69,17 @@ class KeyframeSlider(QSlider):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        # Draw small red marks where keyframes exist
         painter = QPainter(self)
         pen = QPen(Qt.red, 2, Qt.SolidLine)
         painter.setPen(pen)
         h = self.height()
         slider_min = self.minimum()
         slider_max = self.maximum()
-        # A bit more margin from the bar (adjust as desired):
-        # originally was y_mark = h // 2 + 10
-        # Increase to get more space above or below. Adjust as needed:
-        y_mark = (h // 5) + 5  # <-- Moved further down from the handle
+        y_mark = (h // 5) + 5  
 
         for kf in self.keyframes_set:
             if slider_min <= kf <= slider_max:
                 ratio = (kf - slider_min) / float(slider_max - slider_min) if slider_max > slider_min else 0
-                # We'll subtract some padding so the line doesn't go off the edge:
                 x_coord = int(ratio * (self.width() - 20)) + 10
                 painter.drawLine(x_coord, y_mark, x_coord, y_mark + 8)
         painter.end()
@@ -344,7 +180,7 @@ class SubprocessWorker(QThread):
         self.lineReady.emit(f"[INFO] => Running: {' '.join(self.cmd)}")
         
         creation_flags = 0
-        if os.name == "nt":  # Windows only           
+        if os.name == "nt":         
             creation_flags = subprocess.CREATE_NO_WINDOW
         try:
             self.process = subprocess.Popen(
@@ -493,13 +329,23 @@ class StereoMasterGUI(QMainWindow):
         self.depth_global_file = "depth_global_params.json"
         
 
-        self.presets = [None, None, None, None]  # 4 presets
+        self.presets = [None, None, None, None] 
         self.current_batch_worker = None
         self.downscale_inpainting = False 
-        self.mask_dilation_value = 3      
-        self.mask_blur_value = 19
+        self.mask_dilation_value = 1      
+        self.mask_blur_value = 35
+        
+        self.stereo_slider_timer = QTimer(self)
+        self.stereo_slider_timer.setInterval(500)     
+        self.stereo_slider_timer.setSingleShot(True)
+        self.stereo_slider_timer.timeout.connect(self.on_stereo_sliders_timeout)
 
-  
+
+        self.skip_overwrite_depth = False      
+        self.skip_overwrite_splat = False      
+        self.skip_overwrite_inpaint = False    
+        self.crop_border_px = 0 
+        
         self.settings_file = "video_params.json"   
         self.paths_file    = "config_paths.json"     
         
@@ -516,9 +362,9 @@ class StereoMasterGUI(QMainWindow):
         self.inpaint_overlap_batch = 3
         self.inpaint_tile_num_batch = 2
 
-        self.poly_exponent = 1.0       
-        self.poly_fill_tech = "polylines"
-        
+        self.inpaintRadius = 3
+        self.max_small_hole_area = 0
+        self.previous_msha_value = 0
 
         self.load_paths()  
         self.video_params = {}
@@ -570,11 +416,10 @@ class StereoMasterGUI(QMainWindow):
         self.brightness_value = 1.0
         self.gamma_value      = 1.0
         self.dilate_h_value   = 3
-        self.dilate_v_value   = 1
+        self.dilate_v_value   = 2
         self.blur_ksize_value = 3
         self.blur_sigma_value = 2.0
 
-        # Parameters for the original video
         self.orig_brightness = 1.0
         self.orig_gamma      = 1.0
 
@@ -587,20 +432,18 @@ class StereoMasterGUI(QMainWindow):
 
         self.fusion_alpha = 50
 
-        # For Splat and Inpaint: which depth to use for preview and processing
         self.selected_splat_depth = "Depth1"
         self.selected_preview_depth = "Depth1"
 
         self.inpaint_threshold_batch = 0.001
 
-        # Build state combinations for filtering
+
         self.all_state_combos = []
         self.build_state_combos()
 
-        # Stereo warper for preview (ensure your ForwardWarpStereo is imported and defined)
+
         self.stereo_warper = ForwardWarpStereo().cuda()
         
-        # --- INITIALIZE THE USER INTERFACE ---
         self.initUI()
         self.scan_projects()
         self.set_styles()
@@ -668,16 +511,12 @@ class StereoMasterGUI(QMainWindow):
 
 
     def close_dialog_return(self, dialog, result_value):
-        # Guardamos el resultado en el dialog y cerramos
         dialog._result = result_value
         dialog.close()
 
     def save_disclaimer_accepted(self):
-        # Aquí actualizas tu config JSON:
-        # por ejemplo, si usas config_paths.json:
 
         try:
-            # lee config_paths.json
             import json
             with open(self.paths_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1146,7 +985,6 @@ class StereoMasterGUI(QMainWindow):
 
         self.chk_orig      = QCheckBox("Orig")
         self.chk_depth     = QCheckBox("Depth")
-        self.chk_polylines = QCheckBox("Polylines")
         self.chk_anaglyph  = QCheckBox("Forward Warp")
         self.chk_splatted  = QCheckBox("Splatted")
         self.chk_inpaint   = QCheckBox("Completed/Inpainted")
@@ -1161,7 +999,6 @@ class StereoMasterGUI(QMainWindow):
         self.preview_group.addButton(self.chk_depth)
         self.preview_group.addButton(self.chk_splatted)
         self.preview_group.addButton(self.chk_inpaint)
-        self.preview_group.addButton(self.chk_polylines)
         self.preview_group.addButton(self.chk_anaglyph)
 
     
@@ -1173,7 +1010,6 @@ class StereoMasterGUI(QMainWindow):
         self.chk_depth.stateChanged.connect(lambda s: self.show_preview(self.current_frame_idx))
         self.chk_splatted.stateChanged.connect(lambda s: self.show_preview(self.current_frame_idx))
         self.chk_inpaint.stateChanged.connect(lambda s: self.show_preview(self.current_frame_idx))
-        self.chk_polylines.stateChanged.connect(lambda s: self.show_preview(self.current_frame_idx))
         self.chk_anaglyph.stateChanged.connect(lambda s: self.show_preview(self.current_frame_idx))
 
         # Los metemos en un layout horizontal
@@ -1182,7 +1018,6 @@ class StereoMasterGUI(QMainWindow):
         row_mode.addWidget(self.chk_orig)
         row_mode.addWidget(self.chk_depth)
         row_mode.addWidget(self.chk_anaglyph)
-        row_mode.addWidget(self.chk_polylines)
         row_mode.addWidget(self.chk_splatted)
         row_mode.addWidget(self.chk_inpaint)
 
@@ -1308,9 +1143,7 @@ class StereoMasterGUI(QMainWindow):
         self.spin_crafter_guidance.setSingleStep(0.1)
         self.spin_crafter_guidance.setValue(self.crafter_guidance_scale)
 
-        # Conecta el spinbox a tu función "on_crafter_guidance_changed"
         self.spin_crafter_guidance.valueChanged.connect(self.on_crafter_guidance_changed)
-
         crafter_form.addRow("Guidance Scale:", self.spin_crafter_guidance)
 
 
@@ -1323,6 +1156,48 @@ class StereoMasterGUI(QMainWindow):
         crafter_box.setLayout(crafter_form)
         v_layout_dt.addWidget(crafter_box)
         
+        
+        depth_map_box = QGroupBox("For Depth Map Creation")
+        depth_map_layout = QVBoxLayout(depth_map_box)
+  
+        ob_layout = QHBoxLayout()
+        lbl_ob = QLabel("Orig Bri:")
+        self.slider_orig_bri = QSlider(Qt.Horizontal)
+        self.slider_orig_bri.setRange(0, 200)
+        self.slider_orig_bri.setValue(100)
+        self.slider_orig_bri.valueChanged.connect(self.on_orig_brightness_changed)
+        self.lbl_orig_bri_val = QLabel("1.0")
+        btn_reset_ob = QPushButton("R")
+        btn_reset_ob.setFixedWidth(28)
+        btn_reset_ob.clicked.connect(self.reset_orig_bri)
+
+        ob_layout.addWidget(lbl_ob)
+        ob_layout.addWidget(self.slider_orig_bri)
+        ob_layout.addWidget(self.lbl_orig_bri_val)
+        ob_layout.addWidget(btn_reset_ob)
+
+        depth_map_layout.addLayout(ob_layout)
+
+        og_layout = QHBoxLayout()
+        lbl_og = QLabel("Orig Gam:")
+        self.slider_orig_gam = QSlider(Qt.Horizontal)
+        self.slider_orig_gam.setRange(1, 300)
+        self.slider_orig_gam.setValue(100)
+        self.slider_orig_gam.valueChanged.connect(self.on_orig_gamma_changed)
+        self.lbl_orig_gam_val = QLabel("1.0")
+        btn_reset_og = QPushButton("R")
+        btn_reset_og.setFixedWidth(28)
+        btn_reset_og.clicked.connect(self.reset_orig_gamma)
+
+        og_layout.addWidget(lbl_og)
+        og_layout.addWidget(self.slider_orig_gam)
+        og_layout.addWidget(self.lbl_orig_gam_val)
+        og_layout.addWidget(btn_reset_og)
+
+        depth_map_layout.addLayout(og_layout)
+
+        v_layout_dt.addWidget(depth_map_box)
+    
         # === Batch Depth Source ===
         row_bd = QHBoxLayout()
         lbl_bd = QLabel("Depth Model:") 
@@ -1353,270 +1228,9 @@ class StereoMasterGUI(QMainWindow):
         # Tab 3 => Sliders
         tab_sliders = QWidget()
         v_layout_sl = QVBoxLayout(tab_sliders)
-
-        # === 1) Disparity (slider_disp) ===
-        disp_layout = QHBoxLayout()
-        lbl_disp = QLabel("Disparity:")
-        self.slider_disp = QSlider(Qt.Horizontal)
-        self.slider_disp.setRange(0, 100)
-        self.slider_disp.setValue(int(self.disp_value))
-        self.slider_disp.valueChanged.connect(self.on_disp_slider_changed)
-        self.lbl_disp_val = QLabel(str(self.disp_value))
-        btn_reset_disp = QPushButton("R")
-        btn_reset_disp.setFixedWidth(28)
-        btn_reset_disp.clicked.connect(self.reset_disp)
-
-        disp_layout.addWidget(lbl_disp)
-        disp_layout.addWidget(self.slider_disp)
-        disp_layout.addWidget(self.lbl_disp_val)
-        disp_layout.addWidget(btn_reset_disp)
-
-        v_layout_sl.addLayout(disp_layout)
-
-        # === 2) Convergence (slider_conv) ===
-        conv_layout = QHBoxLayout()
-        lbl_conv = QLabel("Convergence:")
-        self.slider_conv = QSlider(Qt.Horizontal)
-        self.slider_conv.setRange(-50, 50)
-        self.slider_conv.setValue(int(self.conv_value))
-        self.slider_conv.valueChanged.connect(self.on_conv_slider_changed)
-        self.lbl_conv_val = QLabel(str(self.conv_value))
-        btn_reset_conv = QPushButton("R")
-        btn_reset_conv.setFixedWidth(28)
-        btn_reset_conv.clicked.connect(self.reset_conv)
-
-        conv_layout.addWidget(lbl_conv)
-        conv_layout.addWidget(self.slider_conv)
-        conv_layout.addWidget(self.lbl_conv_val)
-        conv_layout.addWidget(btn_reset_conv)
-
-        v_layout_sl.addLayout(conv_layout)
-
-        # === 3) Depth Bri (slider_brightness) ===
-        bri_layout = QHBoxLayout()
-        lbl_bri_d = QLabel("Depth Bri:")
-        self.slider_brightness = QSlider(Qt.Horizontal)
-        self.slider_brightness.setRange(0, 200)
-        self.slider_brightness.setValue(int(self.brightness_value * 100))
-        self.slider_brightness.valueChanged.connect(self.on_brightness_slider_changed)
-        self.lbl_bri_val = QLabel(str(self.brightness_value))
-        btn_reset_bri = QPushButton("R")
-        btn_reset_bri.setFixedWidth(28)
-        btn_reset_bri.clicked.connect(self.reset_brightness_depth)
-
-        bri_layout.addWidget(lbl_bri_d)
-        bri_layout.addWidget(self.slider_brightness)
-        bri_layout.addWidget(self.lbl_bri_val)
-        bri_layout.addWidget(btn_reset_bri)
-
-        v_layout_sl.addLayout(bri_layout)
-
-        # === 4) Depth Gam (slider_gamma) ===
-        gam_layout = QHBoxLayout()
-        lbl_gam_d = QLabel("Depth Gam:")
-        self.slider_gamma = QSlider(Qt.Horizontal)
-        self.slider_gamma.setRange(1, 300)
-        self.slider_gamma.setValue(int(self.gamma_value * 100))
-        self.slider_gamma.valueChanged.connect(self.on_gamma_slider_changed)
-        self.lbl_gam_val = QLabel(str(self.gamma_value))
-        btn_reset_gam = QPushButton("R")
-        btn_reset_gam.setFixedWidth(28)
-        btn_reset_gam.clicked.connect(self.reset_gamma_depth)
-
-        gam_layout.addWidget(lbl_gam_d)
-        gam_layout.addWidget(self.slider_gamma)
-        gam_layout.addWidget(self.lbl_gam_val)
-        gam_layout.addWidget(btn_reset_gam)
-
-        v_layout_sl.addLayout(gam_layout)
-
-        # === 5) Dilat.H(px) (slider_dilate_h) ===
-        dh_layout = QHBoxLayout()
-        lbl_dh = QLabel("Dilat.H(px):")
-        self.slider_dilate_h = QSlider(Qt.Horizontal)
-        self.slider_dilate_h.setRange(0, 50)
-        self.slider_dilate_h.setValue(self.dilate_h_value)
-        self.slider_dilate_h.valueChanged.connect(self.on_dilate_h_changed)
-        self.lbl_dh_val = QLabel(str(self.dilate_h_value))
-        btn_reset_dh = QPushButton("R")
-        btn_reset_dh.setFixedWidth(28)
-        btn_reset_dh.clicked.connect(self.reset_dilate_h)
-
-        dh_layout.addWidget(lbl_dh)
-        dh_layout.addWidget(self.slider_dilate_h)
-        dh_layout.addWidget(self.lbl_dh_val)
-        dh_layout.addWidget(btn_reset_dh)
-
-        v_layout_sl.addLayout(dh_layout)
-
-        # === 6) Dilat.V(px) (slider_dilate_v) ===
-        dv_layout = QHBoxLayout()
-        lbl_dv = QLabel("Dilat.V(px):")
-        self.slider_dilate_v = QSlider(Qt.Horizontal)
-        self.slider_dilate_v.setRange(0, 50)
-        self.slider_dilate_v.setValue(self.dilate_v_value)
-        self.slider_dilate_v.valueChanged.connect(self.on_dilate_v_changed)
-        self.lbl_dv_val = QLabel(str(self.dilate_v_value))
-        btn_reset_dv = QPushButton("R")
-        btn_reset_dv.setFixedWidth(28)
-        btn_reset_dv.clicked.connect(self.reset_dilate_v)
-
-        dv_layout.addWidget(lbl_dv)
-        dv_layout.addWidget(self.slider_dilate_v)
-        dv_layout.addWidget(self.lbl_dv_val)
-        dv_layout.addWidget(btn_reset_dv)
-
-        v_layout_sl.addLayout(dv_layout)
-
-        # === 7) BlurK(px) (slider_blur_ksize) ===
-        bk_layout = QHBoxLayout()
-        lbl_bk = QLabel("BlurK(px):")
-        self.slider_blur_ksize = QSlider(Qt.Horizontal)
-        self.slider_blur_ksize.setRange(0, 30)
-        self.slider_blur_ksize.setValue(self.blur_ksize_value)
-        self.slider_blur_ksize.valueChanged.connect(self.on_blur_ksize_changed)
-        self.lbl_bk_val = QLabel(str(self.blur_ksize_value))
-        btn_reset_bk = QPushButton("R")
-        btn_reset_bk.setFixedWidth(28)
-        btn_reset_bk.clicked.connect(self.reset_blur_ksize)
-
-        bk_layout.addWidget(lbl_bk)
-        bk_layout.addWidget(self.slider_blur_ksize)
-        bk_layout.addWidget(self.lbl_bk_val)
-        bk_layout.addWidget(btn_reset_bk)
-
-        v_layout_sl.addLayout(bk_layout)
-
-        # === 8) BlurSigma (slider_blur_sigma) ===
-        bs_layout = QHBoxLayout()
-        lbl_bs = QLabel("BlurSigma:")
-        self.slider_blur_sigma = QSlider(Qt.Horizontal)
-        self.slider_blur_sigma.setRange(0, 50)
-        self.slider_blur_sigma.setValue(int(self.blur_sigma_value * 10))
-        self.slider_blur_sigma.valueChanged.connect(self.on_blur_sigma_changed)
-        self.lbl_bs_val = QLabel(str(self.blur_sigma_value))
-        btn_reset_bs = QPushButton("R")
-        btn_reset_bs.setFixedWidth(28)
-        btn_reset_bs.clicked.connect(self.reset_blur_sigma)
-
-        bs_layout.addWidget(lbl_bs)
-        bs_layout.addWidget(self.slider_blur_sigma)
-        bs_layout.addWidget(self.lbl_bs_val)
-        bs_layout.addWidget(btn_reset_bs)
-
-        v_layout_sl.addLayout(bs_layout)
-
-        warp_box = QGroupBox("Forward Warp Weighted")
-        warp_layout = QVBoxLayout()
-
-        self.slider_warp_exponent = QSlider(Qt.Horizontal)
-        self.slider_warp_exponent.setRange(100, 900)  # i.e. 1.00..3.00 => factor= value/100
-        self.slider_warp_exponent.setValue(141)       # default => 1.41 ~ sqrt(2)
-        self.slider_warp_exponent.valueChanged.connect(self.on_warp_exponent_changed)
-
-        self.lbl_warp_exponent_val = QLabel("1.41")
-
-        btn_reset_we = QPushButton("R")
-        btn_reset_we.setFixedWidth(28)
-        btn_reset_we.clicked.connect(self.reset_warp_exponent)
-
-        row_wexp = QHBoxLayout()
-        row_wexp.addWidget(QLabel("Base:"))
-        row_wexp.addWidget(self.slider_warp_exponent)
-        row_wexp.addWidget(self.lbl_warp_exponent_val)
-        row_wexp.addWidget(btn_reset_we)
-
-        warp_layout.addLayout(row_wexp)
-        warp_box.setLayout(warp_layout)
-        v_layout_sl.addWidget(warp_box)  # to place it in your tab_sliders
-
         
         
-        # === 9) Polylines Box (ya estaba) ===
-        polylines_box = QGroupBox("Polylines")
-        poly_layout = QVBoxLayout(polylines_box)
-
-        # (A) Slider stereo exponent
-        row_exp = QHBoxLayout()
-        lbl_exp = QLabel("Stereo Exponent:")
-        self.slider_poly_exp = QSlider(Qt.Horizontal)
-        self.slider_poly_exp.setRange(1, 300)   # 1..300 => factor value/100 => 0.01..3.0
-        self.slider_poly_exp.setValue(100)      # 1.00 por defecto
-        self.slider_poly_exp.valueChanged.connect(self.on_poly_exp_changed)
-        self.lbl_poly_exp_val = QLabel("1.00")
-
-        btn_reset_exp = QPushButton("R")
-        btn_reset_exp.setFixedWidth(28)
-        btn_reset_exp.clicked.connect(self.reset_poly_exp)
-
-        row_exp.addWidget(lbl_exp)
-        row_exp.addWidget(self.slider_poly_exp)
-        row_exp.addWidget(self.lbl_poly_exp_val)
-        row_exp.addWidget(btn_reset_exp)
-        poly_layout.addLayout(row_exp)
-
-        # (B) Combo fill technique
-        row_fill = QHBoxLayout()
-        lbl_fill = QLabel("Fill Technique:")
-        self.combo_poly_fill = QComboBox()
-        self.combo_poly_fill.addItems(["polylines", "polylines_sharp"])
-        self.combo_poly_fill.setCurrentIndex(0)
-        self.combo_poly_fill.currentIndexChanged.connect(self.on_poly_fill_changed)
-
-        row_fill.addWidget(lbl_fill)
-        row_fill.addWidget(self.combo_poly_fill)
-        poly_layout.addLayout(row_fill)
-
-        polylines_box.setLayout(poly_layout)
-        v_layout_sl.addWidget(polylines_box)
-
-
-        # === 10) Nuevo GroupBox "For Depth Map Creation" (para Orig Bri / Orig Gam) ===
-        depth_map_box = QGroupBox("For Depth Map Creation")
-        depth_map_layout = QVBoxLayout(depth_map_box)
-
-        # 10A) Orig Bri
-        ob_layout = QHBoxLayout()
-        lbl_ob = QLabel("Orig Bri:")
-        self.slider_orig_bri = QSlider(Qt.Horizontal)
-        self.slider_orig_bri.setRange(0, 200)
-        self.slider_orig_bri.setValue(100)
-        self.slider_orig_bri.valueChanged.connect(self.on_orig_brightness_changed)
-        self.lbl_orig_bri_val = QLabel("1.0")
-        btn_reset_ob = QPushButton("R")
-        btn_reset_ob.setFixedWidth(28)
-        btn_reset_ob.clicked.connect(self.reset_orig_bri)
-
-        ob_layout.addWidget(lbl_ob)
-        ob_layout.addWidget(self.slider_orig_bri)
-        ob_layout.addWidget(self.lbl_orig_bri_val)
-        ob_layout.addWidget(btn_reset_ob)
-
-        depth_map_layout.addLayout(ob_layout)
-
-        # 10B) Orig Gam
-        og_layout = QHBoxLayout()
-        lbl_og = QLabel("Orig Gam:")
-        self.slider_orig_gam = QSlider(Qt.Horizontal)
-        self.slider_orig_gam.setRange(1, 300)
-        self.slider_orig_gam.setValue(100)
-        self.slider_orig_gam.valueChanged.connect(self.on_orig_gamma_changed)
-        self.lbl_orig_gam_val = QLabel("1.0")
-        btn_reset_og = QPushButton("R")
-        btn_reset_og.setFixedWidth(28)
-        btn_reset_og.clicked.connect(self.reset_orig_gamma)
-
-        og_layout.addWidget(lbl_og)
-        og_layout.addWidget(self.slider_orig_gam)
-        og_layout.addWidget(self.lbl_orig_gam_val)
-        og_layout.addWidget(btn_reset_og)
-
-        depth_map_layout.addLayout(og_layout)
-
-        v_layout_sl.addWidget(depth_map_box)
-
-
-        # === 11) Nuevo GroupBox "For Edit in Preview" (Preview Bri / Preview Gam) ===
+        
         preview_box = QGroupBox("For Edit in Preview")
         preview_box_layout = QVBoxLayout(preview_box)
 
@@ -1624,8 +1238,8 @@ class StereoMasterGUI(QMainWindow):
         pbri_layout = QHBoxLayout()
         lbl_pbri = QLabel("Preview Bri:")
         self.slider_preview_bri = QSlider(Qt.Horizontal)
-        self.slider_preview_bri.setRange(0, 200)  # factor 0..2.0
-        self.slider_preview_bri.setValue(100)     # 1.0 factor por defecto
+        self.slider_preview_bri.setRange(0, 200)  
+        self.slider_preview_bri.setValue(100)     
         self.slider_preview_bri.valueChanged.connect(self.on_preview_bri_changed)
 
         self.lbl_preview_bri_val = QLabel("1.0")
@@ -1644,8 +1258,8 @@ class StereoMasterGUI(QMainWindow):
         pgam_layout = QHBoxLayout()
         lbl_pgam = QLabel("Preview Gam:")
         self.slider_preview_gamma = QSlider(Qt.Horizontal)
-        self.slider_preview_gamma.setRange(10, 300)  # 0.1 .. 3.0
-        self.slider_preview_gamma.setValue(100)      # 1.0
+        self.slider_preview_gamma.setRange(10, 300) 
+        self.slider_preview_gamma.setValue(100)      
         self.slider_preview_gamma.valueChanged.connect(self.on_preview_gamma_changed)
 
         self.lbl_preview_gamma_val = QLabel("1.0")
@@ -1661,7 +1275,199 @@ class StereoMasterGUI(QMainWindow):
         preview_box_layout.addLayout(pgam_layout)
 
         v_layout_sl.addWidget(preview_box)
+        
+        fw_box = QGroupBox("Forward Warp params")
+        fw_layout = QVBoxLayout()
 
+        #
+        # 1) Disparity
+        #
+        disp_layout = QHBoxLayout()
+        lbl_disp = QLabel("Disparity:")
+        self.slider_disp = QSlider(Qt.Horizontal)
+        self.slider_disp.setRange(0, 200)
+        self.slider_disp.setValue(int(self.disp_value))
+        self.slider_disp.valueChanged.connect(self.on_disp_slider_changed)
+        self.lbl_disp_val = QLabel(str(self.disp_value))
+        btn_reset_disp = QPushButton("R")
+        btn_reset_disp.setFixedWidth(28)
+        btn_reset_disp.clicked.connect(self.reset_disp)
+
+        disp_layout.addWidget(lbl_disp)
+        disp_layout.addWidget(self.slider_disp)
+        disp_layout.addWidget(self.lbl_disp_val)
+        disp_layout.addWidget(btn_reset_disp)
+
+        fw_layout.addLayout(disp_layout)
+
+        #
+        # 2) Convergence
+        #
+        conv_layout = QHBoxLayout()
+        lbl_conv = QLabel("Convergence:")
+        self.slider_conv = QSlider(Qt.Horizontal)
+        self.slider_conv.setRange(-200, 200)
+        self.slider_conv.setValue(int(self.conv_value))
+        self.slider_conv.valueChanged.connect(self.on_conv_slider_changed)
+        self.lbl_conv_val = QLabel(str(self.conv_value))
+        btn_reset_conv = QPushButton("R")
+        btn_reset_conv.setFixedWidth(28)
+        btn_reset_conv.clicked.connect(self.reset_conv)
+
+        conv_layout.addWidget(lbl_conv)
+        conv_layout.addWidget(self.slider_conv)
+        conv_layout.addWidget(self.lbl_conv_val)
+        conv_layout.addWidget(btn_reset_conv)
+
+        fw_layout.addLayout(conv_layout)
+
+        #
+        # 3) Depth Bri
+        #
+        bri_layout = QHBoxLayout()
+        lbl_bri_d = QLabel("Depth Bri:")
+        self.slider_brightness = QSlider(Qt.Horizontal)
+        self.slider_brightness.setRange(0, 600)
+        self.slider_brightness.setValue(int(self.brightness_value * 100))
+        self.slider_brightness.valueChanged.connect(self.on_brightness_slider_changed)
+        self.lbl_bri_val = QLabel(str(self.brightness_value))
+        btn_reset_bri = QPushButton("R")
+        btn_reset_bri.setFixedWidth(28)
+        btn_reset_bri.clicked.connect(self.reset_brightness_depth)
+
+        bri_layout.addWidget(lbl_bri_d)
+        bri_layout.addWidget(self.slider_brightness)
+        bri_layout.addWidget(self.lbl_bri_val)
+        bri_layout.addWidget(btn_reset_bri)
+
+        fw_layout.addLayout(bri_layout)
+
+        #
+        # 4) Depth Gam
+        #
+        gam_layout = QHBoxLayout()
+        lbl_gam_d = QLabel("Depth Gam:")
+        self.slider_gamma = QSlider(Qt.Horizontal)
+        self.slider_gamma.setRange(1, 600)
+        self.slider_gamma.setValue(int(self.gamma_value * 100))
+        self.slider_gamma.valueChanged.connect(self.on_gamma_slider_changed)
+        self.lbl_gam_val = QLabel(str(self.gamma_value))
+        btn_reset_gam = QPushButton("R")
+        btn_reset_gam.setFixedWidth(28)
+        btn_reset_gam.clicked.connect(self.reset_gamma_depth)
+
+        gam_layout.addWidget(lbl_gam_d)
+        gam_layout.addWidget(self.slider_gamma)
+        gam_layout.addWidget(self.lbl_gam_val)
+        gam_layout.addWidget(btn_reset_gam)
+
+        fw_layout.addLayout(gam_layout)
+
+        #
+        # 5) Dilat.H(px)
+        #
+        dh_layout = QHBoxLayout()
+        lbl_dh = QLabel("Dilat.H(px):")
+        self.slider_dilate_h = QSlider(Qt.Horizontal)
+        self.slider_dilate_h.setRange(0, 50)
+        self.slider_dilate_h.setValue(self.dilate_h_value)
+        self.slider_dilate_h.valueChanged.connect(self.on_dilate_h_changed)
+        self.lbl_dh_val = QLabel(str(self.dilate_h_value))
+        btn_reset_dh = QPushButton("R")
+        btn_reset_dh.setFixedWidth(28)
+        btn_reset_dh.clicked.connect(self.reset_dilate_h)
+
+        dh_layout.addWidget(lbl_dh)
+        dh_layout.addWidget(self.slider_dilate_h)
+        dh_layout.addWidget(self.lbl_dh_val)
+        dh_layout.addWidget(btn_reset_dh)
+
+        fw_layout.addLayout(dh_layout)
+
+        #
+        # 6) Dilat.V(px)
+        #
+        dv_layout = QHBoxLayout()
+        lbl_dv = QLabel("Dilat.V(px):")
+        self.slider_dilate_v = QSlider(Qt.Horizontal)
+        self.slider_dilate_v.setRange(0, 50)
+        self.slider_dilate_v.setValue(self.dilate_v_value)
+        self.slider_dilate_v.valueChanged.connect(self.on_dilate_v_changed)
+        self.lbl_dv_val = QLabel(str(self.dilate_v_value))
+        btn_reset_dv = QPushButton("R")
+        btn_reset_dv.setFixedWidth(28)
+        btn_reset_dv.clicked.connect(self.reset_dilate_v)
+
+        dv_layout.addWidget(lbl_dv)
+        dv_layout.addWidget(self.slider_dilate_v)
+        dv_layout.addWidget(self.lbl_dv_val)
+        dv_layout.addWidget(btn_reset_dv)
+
+        fw_layout.addLayout(dv_layout)
+
+        #
+        # 7) BlurK(px)
+        #
+        bk_layout = QHBoxLayout()
+        lbl_bk = QLabel("BlurK(px):")
+        self.slider_blur_ksize = QSlider(Qt.Horizontal)
+        self.slider_blur_ksize.setRange(0, 30)
+        self.slider_blur_ksize.setValue(self.blur_ksize_value)
+        self.slider_blur_ksize.valueChanged.connect(self.on_blur_ksize_changed)
+        self.lbl_bk_val = QLabel(str(self.blur_ksize_value))
+        btn_reset_bk = QPushButton("R")
+        btn_reset_bk.setFixedWidth(28)
+        btn_reset_bk.clicked.connect(self.reset_blur_ksize)
+
+        bk_layout.addWidget(lbl_bk)
+        bk_layout.addWidget(self.slider_blur_ksize)
+        bk_layout.addWidget(self.lbl_bk_val)
+        bk_layout.addWidget(btn_reset_bk)
+
+        fw_layout.addLayout(bk_layout)
+
+        #
+        # 8) BlurSigma
+        #
+        bs_layout = QHBoxLayout()
+        lbl_bs = QLabel("BlurSigma:")
+        self.slider_blur_sigma = QSlider(Qt.Horizontal)
+        self.slider_blur_sigma.setRange(0, 50)
+        self.slider_blur_sigma.setValue(int(self.blur_sigma_value * 10))
+        self.slider_blur_sigma.valueChanged.connect(self.on_blur_sigma_changed)
+        self.lbl_bs_val = QLabel(str(self.blur_sigma_value))
+        btn_reset_bs = QPushButton("R")
+        btn_reset_bs.setFixedWidth(28)
+        btn_reset_bs.clicked.connect(self.reset_blur_sigma)
+
+        bs_layout.addWidget(lbl_bs)
+        bs_layout.addWidget(self.slider_blur_sigma)
+        bs_layout.addWidget(self.lbl_bs_val)
+        bs_layout.addWidget(btn_reset_bs)
+
+        fw_layout.addLayout(bs_layout)
+
+        row_wexp = QHBoxLayout()
+        lbl_fw = QLabel("Forward Warp Weighted:")
+        row_wexp.addWidget(lbl_fw)
+
+        self.slider_warp_exponent = QSlider(Qt.Horizontal)
+        self.slider_warp_exponent.setRange(100, 900)  
+        self.slider_warp_exponent.setValue(141)      
+        self.slider_warp_exponent.valueChanged.connect(self.on_warp_exponent_changed)
+        row_wexp.addWidget(self.slider_warp_exponent)
+
+        self.lbl_warp_exponent_val = QLabel("1.41")
+        row_wexp.addWidget(self.lbl_warp_exponent_val)
+
+        btn_reset_we = QPushButton("R")
+        btn_reset_we.setFixedWidth(28)
+        btn_reset_we.clicked.connect(self.reset_warp_exponent)
+        row_wexp.addWidget(btn_reset_we)
+        fw_layout.addLayout(row_wexp) 
+        fw_box.setLayout(fw_layout)
+
+        v_layout_sl.addWidget(fw_box)
 
         # === 12) Keyframes GroupBox ===
         keyf_box = QGroupBox("Keyframes")
@@ -1688,10 +1494,36 @@ class StereoMasterGUI(QMainWindow):
         keyf_layout.addLayout(row_kf_btns)
         keyf_box.setLayout(keyf_layout)
         v_layout_sl.addWidget(keyf_box)
+        
+        v_layout_sl.addSpacing(10)
+    
+        self.btn_save_video_settings = QPushButton("Save Settings (No video selected)")
+        self.btn_save_video_settings.setEnabled(False)
+        self.btn_save_video_settings.setFixedHeight(40)
+        self.btn_save_video_settings.clicked.connect(self.on_save_video_settings_clicked)
+        self.btn_save_video_settings.setStyleSheet("""
+            QPushButton {
+                background-color: #2471A3; /* Azul, más oscuro que #2E86C1 */
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: #1B4F72; /* Un tono más oscuro en hover */
+            }
+        """)
+
+        v_layout_sl.addWidget(self.btn_save_video_settings)  
+
+        v_layout_sl.addSpacing(15)        
 
         # === 13) Presets Box (ahora inmediatamente después de Keyframes) ===
         presets_box = QGroupBox("Presets")
         presets_layout = QVBoxLayout()
+
+        right_tab_widget.addTab(tab_sliders, "Adjust Stereo")
 
         # Preset 1
         row1 = QHBoxLayout()
@@ -1750,13 +1582,57 @@ class StereoMasterGUI(QMainWindow):
         # === 15) Finalmente añadimos la pestaña al QTabWidget ===
         right_tab_widget.addTab(tab_sliders, "Adjust Stereo")
         
-        
+                
         # Tab 4 => Stereo Generation
-        
         tab_batch = QWidget()
         v_layout_bt = QVBoxLayout(tab_batch)
-         
 
+        # === Splatting Params (nuevo QGroupBox) ===
+        splatting_box = QGroupBox("Splatting Params")
+        splatting_layout = QVBoxLayout(splatting_box)  # <- cambió a QVBoxLayout
+
+
+        # inpaintRadius
+        row_inpaintRadius = QHBoxLayout()
+        lbl_inpR = QLabel("Inpaint Radius:")
+        self.spin_inpaintRadius = QSpinBox()
+        self.spin_inpaintRadius.setRange(0, 99)
+        self.spin_inpaintRadius.setValue(3)
+        self.spin_inpaintRadius.valueChanged.connect(lambda v: setattr(self, "inpaintRadius", v))
+        row_inpaintRadius.addWidget(lbl_inpR)
+        row_inpaintRadius.addWidget(self.spin_inpaintRadius)
+        splatting_layout.addLayout(row_inpaintRadius)
+
+        # max_small_hole_area
+        row_msha = QHBoxLayout()
+        lbl_msha = QLabel("Small Hole Fill Threshold:")
+        self.spin_max_small_hole_area = QSpinBox()
+        self.spin_max_small_hole_area.setRange(0, 999999)
+        self.spin_max_small_hole_area.setValue(100)
+        self.spin_max_small_hole_area.valueChanged.connect(self.on_max_small_hole_area_changed)
+        row_msha.addWidget(lbl_msha)
+        row_msha.addWidget(self.spin_max_small_hole_area)
+        splatting_layout.addLayout(row_msha)
+        
+        
+        row_crop = QHBoxLayout()
+        lbl_crop = QLabel("Crop Border (px):")
+        self.spin_crop_border = QSpinBox()
+        self.spin_crop_border.setRange(0, 200)     
+        self.spin_crop_border.setValue(0)          
+        self.spin_crop_border.valueChanged.connect(self.on_crop_border_changed)
+        row_crop.addWidget(lbl_crop)
+        row_crop.addWidget(self.spin_crop_border)
+        splatting_layout.addLayout(row_crop)
+
+
+        # Full Quick Fill Holes
+        self.chk_quick_fill = QCheckBox("Full Quick Fill Holes")
+        self.chk_quick_fill.stateChanged.connect(self.on_quick_fill_changed)
+        splatting_layout.addWidget(self.chk_quick_fill)
+
+        # Añadir el groupbox al layout de la pestaña Generate Stereo
+        v_layout_bt.addWidget(splatting_box)
 
         # === Batch Splat Source ===
         row_bs = QHBoxLayout()
@@ -1766,57 +1642,37 @@ class StereoMasterGUI(QMainWindow):
         row_bs.addWidget(lbl_bs2)
         row_bs.addWidget(self.combo_batch_splat_source)
         v_layout_bt.addLayout(row_bs)
-        
+
         self.check_overwrite_splat = QCheckBox("Overwrite existing splat (Don't ask)")
         self.check_overwrite_splat.setChecked(False)
         v_layout_bt.addWidget(self.check_overwrite_splat)
 
-        btn_batch_splat = QPushButton("Generate Splat 2x2 + Anaglyph ")
-        btn_batch_splat.setFixedHeight(28)
-        btn_batch_splat.clicked.connect(self.batch_splat_selected)
-        v_layout_bt.addWidget(btn_batch_splat)
+        self.btn_batch_splat = QPushButton("Generate Splat 2x2 + Anaglyph ")
+        self.btn_batch_splat.setFixedHeight(40)
+        self.btn_batch_splat.clicked.connect(self.batch_splat_selected)
 
-        # === Widgets para inpainting batch (Threshold, Overlap, Tile, Steps) ===
-        inpaint_threshold_batch_label = QLabel("Inpaint Threshold Mask:")
-        self.spin_inpaint_threshold_batch = QDoubleSpinBox()
-        self.spin_inpaint_threshold_batch.setRange(0.0, 1.0)
-        self.spin_inpaint_threshold_batch.setDecimals(3)
-        self.spin_inpaint_threshold_batch.setSingleStep(0.001)
-        self.spin_inpaint_threshold_batch.setValue(self.inpaint_threshold_batch)
-        self.spin_inpaint_threshold_batch.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
-        self.spin_inpaint_threshold_batch.valueChanged.connect(self.on_inpaint_threshold_batch_changed)
+        self.btn_batch_splat.setStyleSheet("""
+            QPushButton {
+                background-color: #2471A3;
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: #1B4F72;
+            }
+        """)
 
-        inpaint_overlap_batch_label = QLabel("Inpaint Overlap:")
-        self.spin_inpaint_overlap_batch = QSpinBox()
-        self.spin_inpaint_overlap_batch.setRange(0, 100)
-        self.spin_inpaint_overlap_batch.setValue(self.inpaint_overlap_batch)
-        self.spin_inpaint_overlap_batch.valueChanged.connect(
-            lambda val: setattr(self, 'inpaint_overlap_batch', val)
-        )
+        v_layout_bt.addWidget(self.btn_batch_splat)
 
-        inpaint_tile_num_batch_label = QLabel("Inpaint Tile Num:")
-        self.spin_inpaint_tile_batch = QSpinBox()
-        self.spin_inpaint_tile_batch.setRange(1, 10)
-        self.spin_inpaint_tile_batch.setValue(self.inpaint_tile_num_batch)
-        self.spin_inpaint_tile_batch.valueChanged.connect(
-            lambda val: setattr(self, 'inpaint_tile_num_batch', val)
-        )
 
-        steps_label_batch = QLabel("Num Inference Steps:")
-        self.spin_inpaint_steps_batch = QSpinBox()
-        self.spin_inpaint_steps_batch.setRange(1, 50)
-        self.spin_inpaint_steps_batch.setValue(self.inpaint_num_inference_steps_batch)
-        self.spin_inpaint_steps_batch.valueChanged.connect(self.on_inpaint_steps_batch_changed)
-
-        # === Creamos un QGroupBox para agruparlos: "StereoCrafter Params" ===
+        # === StereoCrafter Params (otro QGroupBox) ===
         sc_box_batch = QGroupBox("StereoCrafter Params")
         sc_layout_batch = QVBoxLayout(sc_box_batch)
 
-        # Añadimos los controles al layout del groupbox
-        sc_layout_batch.addWidget(inpaint_threshold_batch_label)
-        sc_layout_batch.addWidget(self.spin_inpaint_threshold_batch)
-
-        # NEW: Add spinbox for "Mask Dilation"
+        # Mask Dilation
         dilation_label = QLabel("Mask Dilation:")
         self.spin_mask_dilation = QSpinBox()
         self.spin_mask_dilation.setRange(0, 999)
@@ -1825,77 +1681,120 @@ class StereoMasterGUI(QMainWindow):
         sc_layout_batch.addWidget(dilation_label)
         sc_layout_batch.addWidget(self.spin_mask_dilation)
 
-        # NEW: Add spinbox for "Mask Blur"
+        # Mask Blur
         blur_label = QLabel("Mask Blur (must be odd):")
         self.spin_mask_blur = QSpinBox()
         self.spin_mask_blur.setRange(1, 999)
-        self.mask_blur_value = 19
+        self.mask_blur_value = 35
         self.spin_mask_blur.setValue(self.mask_blur_value)
         self.spin_mask_blur.valueChanged.connect(self.on_mask_blur_changed)
         sc_layout_batch.addWidget(blur_label)
         sc_layout_batch.addWidget(self.spin_mask_blur)
-        
 
+        # Inpaint Overlap
+        inpaint_overlap_batch_label = QLabel("Inpaint Overlap:")
         sc_layout_batch.addWidget(inpaint_overlap_batch_label)
+        self.spin_inpaint_overlap_batch = QSpinBox()
+        self.spin_inpaint_overlap_batch.setRange(0, 100)
+        self.spin_inpaint_overlap_batch.setValue(self.inpaint_overlap_batch)
+        self.spin_inpaint_overlap_batch.valueChanged.connect(
+            lambda val: setattr(self, 'inpaint_overlap_batch', val)
+        )
         sc_layout_batch.addWidget(self.spin_inpaint_overlap_batch)
 
+        # Inpaint Tile Num
+        inpaint_tile_num_batch_label = QLabel("Inpaint Tile Num:")
         sc_layout_batch.addWidget(inpaint_tile_num_batch_label)
+        self.spin_inpaint_tile_batch = QSpinBox()
+        self.spin_inpaint_tile_batch.setRange(1, 10)
+        self.spin_inpaint_tile_batch.setValue(self.inpaint_tile_num_batch)
+        self.spin_inpaint_tile_batch.valueChanged.connect(
+            lambda val: setattr(self, 'inpaint_tile_num_batch', val)
+        )
         sc_layout_batch.addWidget(self.spin_inpaint_tile_batch)
 
+        # Num Inference Steps
+        steps_label_batch = QLabel("Num Inference Steps:")
         sc_layout_batch.addWidget(steps_label_batch)
+        self.spin_inpaint_steps_batch = QSpinBox()
+        self.spin_inpaint_steps_batch.setRange(1, 50)
+        self.spin_inpaint_steps_batch.setValue(self.inpaint_num_inference_steps_batch)
+        self.spin_inpaint_steps_batch.valueChanged.connect(self.on_inpaint_steps_batch_changed)
         sc_layout_batch.addWidget(self.spin_inpaint_steps_batch)
-        
+
+        # Frames Chunk
+        sc_layout_batch.addWidget(QLabel("Frames Chunk:"))
         self.spin_frames_chunk = QSpinBox()
         self.spin_frames_chunk.setRange(1, 9999)
         self.spin_frames_chunk.setValue(self.frames_chunk_val)
-        sc_layout_batch.addWidget(QLabel("Frames Chunk:"))
         sc_layout_batch.addWidget(self.spin_frames_chunk)
-                
+
+        # Partial Ref Frames
+        sc_layout_batch.addWidget(QLabel("Partial Ref Frames:"))
         self.spin_partial_ref_frames = QSpinBox()
         self.spin_partial_ref_frames.setRange(1, 999)
         self.spin_partial_ref_frames.setValue(self.partial_ref_frames_val)
-        self.spin_partial_ref_frames.setEnabled(False) 
-        sc_layout_batch.addWidget(QLabel("Partial Ref Frames:"))
+        self.spin_partial_ref_frames.setEnabled(False)
         sc_layout_batch.addWidget(self.spin_partial_ref_frames)
 
-        self.chk_color_ref = QCheckBox("Use Partial Color Reference Frames of the previus chunk")
+        self.chk_color_ref = QCheckBox("Use Partial Color Reference Frames of the previous chunk")
         self.chk_color_ref.setChecked(False)
         self.chk_color_ref.stateChanged.connect(self.on_partial_color_ref_changed)
-        sc_layout_batch.addWidget(self.chk_color_ref)     
-                
+        sc_layout_batch.addWidget(self.chk_color_ref)
+
         self.chk_downscale_inpaint = QCheckBox("Downscale Inpainting")
         self.chk_downscale_inpaint.setChecked(False)
         self.chk_downscale_inpaint.stateChanged.connect(self.on_downscale_inpaint_changed)
         sc_layout_batch.addWidget(self.chk_downscale_inpaint)
 
+        self.chk_no_inpaint = QCheckBox("No Inpaint (Use this if your splat was created with 'Full Quick Fill Holes')")
+        self.chk_no_inpaint.setChecked(False)
+        sc_layout_batch.addWidget(self.chk_no_inpaint)
+
         sc_box_batch.setLayout(sc_layout_batch)
-
-
         v_layout_bt.addWidget(sc_box_batch)
-        
+
         self.check_overwrite_inpaint = QCheckBox("Overwrite existing inpaint (Don't ask)")
         self.check_overwrite_inpaint.setChecked(False)
         v_layout_bt.addWidget(self.check_overwrite_inpaint)
 
         # === Botón Batch Inpaint ===
-        btn_batch_inpaint = QPushButton("Generate SBS Inpaint (Splat needed)")
-        btn_batch_inpaint.setFixedHeight(28)
-        btn_batch_inpaint.clicked.connect(self.batch_inpaint_selected)
-        v_layout_bt.addWidget(btn_batch_inpaint)
-                         
+        self.btn_batch_inpaint = QPushButton("Generate Stereo SBS (Splat needed)")
+        self.btn_batch_inpaint.setFixedHeight(40)
+        self.btn_batch_inpaint.clicked.connect(self.batch_inpaint_selected)
+        self.btn_batch_inpaint.setStyleSheet("""
+            QPushButton {
+                background-color: #2471A3;
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: #1B4F72;
+            }
+        """)
+        v_layout_bt.addWidget(self.btn_batch_inpaint)
 
-        self.btn_direct_stereo = QPushButton("Generate Direct Inpainted Stereo (All Steps)")
-        self.btn_direct_stereo.setFixedHeight(50)  
+        self.btn_direct_stereo = QPushButton("Generate Direct Stereo SBS (All Steps)")
+        self.btn_direct_stereo.setFixedHeight(50)
         self.btn_direct_stereo.clicked.connect(self.batch_direct_stereo)
-        v_layout_bt.addWidget(self.btn_direct_stereo)            
-                    
-        v_layout_bt.addSpacing(5)
-             
-        self.btn_polylines_sbs = QPushButton("Generate Stereo SBS Polylines (experimental)")
-        self.btn_polylines_sbs.setFixedHeight(28)
-        self.btn_polylines_sbs.clicked.connect(self.do_polylines_sbs)
-        v_layout_bt.addWidget(self.btn_polylines_sbs)
-        self.btn_polylines_sbs.setStyleSheet("background-color: #5DADE2; color: white;")
+        self.btn_direct_stereo.setStyleSheet("""
+            QPushButton {
+                background-color: #2471A3;
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: #1B4F72;
+            }
+        """)
+        v_layout_bt.addWidget(self.btn_direct_stereo)
+
 
         v_layout_bt.addSpacing(20)
 
@@ -1911,16 +1810,13 @@ class StereoMasterGUI(QMainWindow):
         btn_merge_videos = QPushButton("Merge Selected Videos")
         btn_merge_videos.setFixedHeight(28)
         btn_merge_videos.clicked.connect(self.merge_selected_videos)
-        v_layout_bt.addWidget(btn_merge_videos)      
-       
-   
-        v_layout_bt.addSpacerItem(QSpacerItem(20,20,QSizePolicy.Minimum,QSizePolicy.Expanding))
-        
-  
-      
+        v_layout_bt.addWidget(btn_merge_videos)
 
+        v_layout_bt.addSpacerItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         right_tab_widget.addTab(tab_batch, "Generate Stereo")
+
+
 
         # ------------------------------
         # Tab Output (no lo modificamos)
@@ -2089,7 +1985,6 @@ class StereoMasterGUI(QMainWindow):
         self.slider_blur_sigma.setValue(int(self.blur_sigma_value * 10))
         self.lbl_bs_val.setText(f"{self.blur_sigma_value:.2f}")
 
-        # (Opcional) Actualizar la vista previa
         self.log(f"[PRESET] => Loaded preset #{preset_index+1} => {preset_data}")
         self.show_preview(self.current_frame_idx)
         self.store_current_params()
@@ -2111,7 +2006,6 @@ class StereoMasterGUI(QMainWindow):
             QMessageBox.information(self, "Info", "No videos selected to delete.")
             return
 
-        # 1) Gather all 'base_name' from selected items
         base_names_to_delete = set()
         for item in sel_items:
             dd = item.data(Qt.UserRole)
@@ -2125,7 +2019,6 @@ class StereoMasterGUI(QMainWindow):
             QMessageBox.information(self, "Info", "No valid 'base_name' found in the selected items.")
             return
 
-        # Helper to shorten a potentially long list
         def shorten_list(items, max_items=10):
             items_list = list(items)
             total = len(items_list)
@@ -2136,7 +2029,6 @@ class StereoMasterGUI(QMainWindow):
                 remaining = total - max_items
                 return "\n".join(f" - {x}" for x in shown) + f"\n  ... plus {remaining} more"
 
-        # 2) Confirmation dialog (shortened list)
         summary_len = len(base_names_to_delete)
         items_str = shorten_list(base_names_to_delete, max_items=10)
 
@@ -2158,8 +2050,6 @@ class StereoMasterGUI(QMainWindow):
         if confirm == QMessageBox.No:
             return
 
-        # 3) Force-close *all* open decord references before deleting anything
-        #    and clear the preview label so Windows won't keep them locked.
         self.vid_original = None
         self.vid_depth = None
         self.vid_depth2 = None
@@ -2170,17 +2060,15 @@ class StereoMasterGUI(QMainWindow):
         import gc
         gc.collect()
 
-        # 4) Build a list of all physical files to delete
         files_to_delete = []
         for (b_name, st_list, detail, ddict) in self.all_items_data:
             if b_name in base_names_to_delete:
-                # Gather possible video files
+
                 for key_ in ["orig", "depth1", "depth2", "depthf", "splatted", "inpainted"]:
                     path_ = ddict.get(key_, "")
                     if path_ and os.path.isfile(path_):
                         files_to_delete.append(path_)
 
-                        # If it's splatted, also remove the optional _left/_mask if they exist
                         if key_ == "splatted":
                             dirname = os.path.dirname(path_)
                             fname = os.path.basename(path_)
@@ -2192,7 +2080,7 @@ class StereoMasterGUI(QMainWindow):
                             if os.path.isfile(mask_candidate):
                                 files_to_delete.append(mask_candidate)
 
-        # 5) Delete each file
+
         for fpath in set(files_to_delete):
             try:
                 os.remove(fpath)
@@ -2200,7 +2088,7 @@ class StereoMasterGUI(QMainWindow):
             except Exception as e:
                 self.log(f"[DELETE] => cannot remove {fpath} => {e}")
 
-        # 6) Remove the entries from self.all_items_data
+
         new_list_data = []
         for entry in self.all_items_data:
             (b_name, st_list, detail, ddict) = entry
@@ -2210,10 +2098,8 @@ class StereoMasterGUI(QMainWindow):
                 self.log(f"[DELETE] => Removing data for '{b_name}' from list.")
         self.all_items_data = new_list_data
 
-        # 7) Refresh the list visually
         self.apply_filter_list()
 
-        # 8) Show a short final message as well
         deleted_items_str = shorten_list(base_names_to_delete, max_items=10)
         QMessageBox.information(
             self,
@@ -2251,8 +2137,6 @@ class StereoMasterGUI(QMainWindow):
             "dilate_v_value": self.dilate_v_value,
             "blur_ksize_value": self.blur_ksize_value,
             "blur_sigma_value": self.blur_sigma_value,
-            "stereo_offset_exponent_value": self.poly_exponent,
-            "fill_technique_value": self.poly_fill_tech,
             "warp_exponent_base": self.warp_exponent_base
         }
         self.video_params[base_]["keyframes"][str(current_frame)] = kf_data
@@ -2462,7 +2346,6 @@ class StereoMasterGUI(QMainWindow):
         import os
         import sys
 
-        # 1) Determinar threshold
         if threshold is None:
             threshold_str = self.combo_scene_threshold.currentText().strip()
             if not threshold_str.isdigit():
@@ -2472,7 +2355,7 @@ class StereoMasterGUI(QMainWindow):
         else:
             threshold = str(threshold)
 
-        # 2) Determinar la ruta del vídeo original
+
         if video_path is None:
             if not self.selected_video_path:
                 QMessageBox.warning(self, "Attention", "No video selected for scene detect.")
@@ -2483,11 +2366,8 @@ class StereoMasterGUI(QMainWindow):
             QMessageBox.warning(self, "Attention", f"Video file not found:\n{video_path}")
             return
 
-        # Convertir a ruta absoluta (para que no haya problemas con os.path)
         video_path_abs = os.path.abspath(video_path)
-
-
-        # 3) Construir el comando para SceneDetect
+  
         cmd = [
             sys.executable, "-m", "scenedetect",
             "-i", video_path_abs,
@@ -2495,19 +2375,16 @@ class StereoMasterGUI(QMainWindow):
             "detect-content",
             "-t", threshold,
             "split-video",
-            "--preset", "slower",  # Uno de los permitidos: ultrafast, superfast, etc.
+            "--preset", "slower", 
             "--args=-c:v libx264 -crf 0 -c:a copy"
         ]
 
-
         self.log(f"[INFO] => scenedetect => {cmd}")
 
-        # 4) Creamos el worker
         self.scene_worker = SubprocessWorker(cmd)
         self.scene_worker.lineReady.connect(self.log)
 
-        # IMPORTANTE: Pasamos video_path_abs en la lambda para que
-        # on_scene_detect_finished reciba la ruta como segundo param (original_path).
+
         self.scene_worker.finishedSignal.connect(
             lambda success: self.on_scene_detect_finished(success, video_path_abs)
         )
@@ -2551,7 +2428,6 @@ class StereoMasterGUI(QMainWindow):
         else:
             self.log("[ERROR] => scenedetect failed.")
 
-        # Refrescar la lista tras el split
         self.scan_and_list_videos()
 
 
@@ -2657,21 +2533,20 @@ class StereoMasterGUI(QMainWindow):
         sel_filter = self.filter_combo.currentText()
 
         for (base_, st_list, detail, ddict) in self.all_items_data:
-            # Cuando NO hay vídeo ni depth ni nada => st_list == ["NO VIDEO?"]
+  
             if st_list == ["NO VIDEO?"]:
-                # Solo se muestra si el filtro es "ALL"
+
                 if sel_filter != "ALL":
                     continue
                 st_str = "NO VIDEO?"
             else:
-                # st_list puede ser ["ORIG","DEPTH"] => "ORIG + DEPTH"
+
                 st_str = " + ".join(st_list)
 
-            # Si no es "ALL", filtramos por coincidencia exacta con st_str
+
             if sel_filter != "ALL" and sel_filter != st_str:
                 continue
 
-            # Construimos el texto a mostrar en la lista
             txt = f"[{st_str}] {base_}"
             if detail:
                 txt += " (" + ", ".join(detail) + ")"
@@ -2685,7 +2560,6 @@ class StereoMasterGUI(QMainWindow):
         if not dd:
             return
 
-        # Limpiamos referencias previas y el label
         self.vid_original = None
         self.vid_depth = None
         self.vid_depth2 = None
@@ -2751,7 +2625,6 @@ class StereoMasterGUI(QMainWindow):
                 self.log("[ERROR] => load splatted => " + str(e))
                 self.vid_splatted = None
 
-        # 6) Cargar INPAINTED
         if self.inpainted_video_path and os.path.isfile(self.inpainted_video_path):
             try:
                 vr = VideoReader(self.inpainted_video_path, ctx=cpu(0))
@@ -2761,7 +2634,6 @@ class StereoMasterGUI(QMainWindow):
                 self.log("[ERROR] => load inpainted => " + str(e))
                 self.vid_inpainted = None
 
-        # 7) Determinar num_frames = máx de TODOS los videos cargados
         potential_counts = []
         if self.vid_original:
             potential_counts.append(len(self.vid_original))
@@ -2782,13 +2654,11 @@ class StereoMasterGUI(QMainWindow):
             self.slider_frames.setValue(0)
             self.current_frame_idx = 0
         else:
-            # No hay ningún video cargado
             self.num_frames = 0
             self.slider_frames.setMaximum(0)
             self.slider_frames.setValue(0)
             self.log("[WARN] => No video available to preview.")
 
-        # (A) => Si el original existe y es muy largo (>650 frames), mostrar advertencia
         if self.vid_original and len(self.vid_original) > 650:
             import PyQt5.QtWidgets as QtW
             msg = (
@@ -2825,7 +2695,6 @@ class StereoMasterGUI(QMainWindow):
                 self.log("[INFO] => User cancelled loading this long video.")
                 return
 
-        # 8) Restaurar sliders (per-video) => si base_ está en video_params
         if base_ in self.video_params:
             vp = self.video_params[base_]
             self.disp_value = vp.get("disp_value", 20.0)
@@ -2865,18 +2734,16 @@ class StereoMasterGUI(QMainWindow):
             self.slider_blur_sigma.setValue(int(self.blur_sigma_value * 10))
             self.lbl_bs_val.setText(str(self.blur_sigma_value))
 
-        # 9) Actualizar combo de keyframes, etc.
         current_fr = self.current_frame_idx
         self.update_keyframes_ui(block_signals=True)
         self.slider_frames.setValue(current_fr)
 
-        # 10) Mostrar preview primer frame
         if self.num_frames > 0:
             self.show_preview(0)
-
-
+            
+        self.update_save_button_text()
+    
     def on_create_project_clicked(self):
-        # 1) Pedir el nombre del proyecto
         from PyQt5.QtWidgets import QInputDialog, QMessageBox
         project_name, ok = QInputDialog.getText(
             self,
@@ -2884,17 +2751,16 @@ class StereoMasterGUI(QMainWindow):
             "Enter project name:"
         )
         if not ok or not project_name.strip():
-            # Usuario canceló o dejó vacío
+
             return
 
         project_name = project_name.strip()
 
-        # 2) Definir la carpeta raíz “projects” (al lado de tu script, por ej.)
         projects_root = os.path.abspath("projects")
         if not os.path.isdir(projects_root):
             os.makedirs(projects_root, exist_ok=True)
 
-        # 3) Crear la carpeta del proyecto
+
         project_folder = os.path.join(projects_root, project_name)
         if os.path.exists(project_folder):
             resp = QMessageBox.question(
@@ -2909,7 +2775,6 @@ class StereoMasterGUI(QMainWindow):
         else:
             os.makedirs(project_folder, exist_ok=True)
 
-        # 4) Crear subcarpetas => input_videos, pre_depth, ...
         subfolders = [
             "input_videos", "pre_depth", "pre_depth2",
             "pre_depth_final", "output_splattings",
@@ -2919,16 +2784,14 @@ class StereoMasterGUI(QMainWindow):
             path_ = os.path.join(project_folder, sf)
             os.makedirs(path_, exist_ok=True)
 
-        # 5) Actualizamos la interfaz: 
-        #    - Rellenar de nuevo la combo con todos los proyectos detectados
         self.scan_projects()
 
-        # 6) Seleccionar en la combo el que acabamos de crear (si existe):
+
         idx_new = self.combo_projects.findText(project_name)
         if idx_new >= 0:
             self.combo_projects.setCurrentIndex(idx_new)
         else:
-            # Si no está, algo raro pasó, pero no pasa nada
+
             pass
 
         QMessageBox.information(
@@ -2939,11 +2802,6 @@ class StereoMasterGUI(QMainWindow):
 
 
     def clear_current_loaded_video(self):
-        """
-        Limpia cualquier referencia a decord u otras variables de vídeo,
-        así como el label de previsualización y la lista de videos.
-        """
-        # 1) Liberar referencias de decord
         self.vid_original = None
         self.vid_depth = None
         self.vid_depth2 = None
@@ -2951,18 +2809,14 @@ class StereoMasterGUI(QMainWindow):
         self.vid_splatted = None
         self.vid_inpainted = None
 
-        # 2) Limpiar label preview y forzar re-dibujo
         self.label_preview.clear()
         self.label_preview.update()
 
-        # 3) Restablecer contadores de frames
         self.num_frames = 0
         self.current_frame_idx = 0
 
-        # 4) Vaciar la lista de items (para que no queden vídeos del proyecto anterior)
         self.list_widget.clear()
 
-        # 5) (Opcional) forzar garbage collection, útil en Windows
         import gc
         gc.collect()
 
@@ -2974,14 +2828,13 @@ class StereoMasterGUI(QMainWindow):
         if not project_name or project_name.startswith("<No Projects"):
             return
 
-        # --- CASO ESPECIAL: limpiar vídeos abiertos ANTES de cambiar a las nuevas rutas
         self.clear_current_loaded_video()
 
-        # A partir de aquí, tus rutas cambian a las del proyecto elegido:
+
         projects_root = os.path.abspath("projects")
         project_folder = os.path.join(projects_root, project_name)
 
-        # Asignas subcarpetas
+
         self.dir_input_videos = os.path.join(project_folder, "input_videos")
         self.dir_pre_depth = os.path.join(project_folder, "pre_depth")
         self.dir_pre_depth2 = os.path.join(project_folder, "pre_depth2")
@@ -2990,7 +2843,6 @@ class StereoMasterGUI(QMainWindow):
         self.dir_inpainting_out = os.path.join(project_folder, "inpainting_out")
         self.dir_completed_merged = os.path.join(project_folder, "completed_merged")
 
-        # Reflejar en los QLineEdit
         self.input_videos_edit.setText(self.dir_input_videos)
         self.pre_depth_edit.setText(self.dir_pre_depth)
         self.pre_depth2_edit.setText(self.dir_pre_depth2)
@@ -2999,8 +2851,6 @@ class StereoMasterGUI(QMainWindow):
         self.inpainting_out_edit.setText(self.dir_inpainting_out)
         self.completed_merged_edit.setText(self.dir_completed_merged)
 
-        # Guardar config y volver a escanear => poblar self.list_widget con los 
-        # vídeos de la nueva carpeta de proyecto
         self.save_paths()
         self.scan_and_list_videos()
 
@@ -3017,8 +2867,6 @@ class StereoMasterGUI(QMainWindow):
     def scan_and_list_videos(self, reselect_base=None):
         self.log("=> Scanning videos ...")
         self.save_paths()
-
-        # [AÑADIDO] Guardar selección actual por base_name
         selected_bases = set()
         for it in self.list_widget.selectedItems():
             dd = it.data(Qt.UserRole)
@@ -3027,7 +2875,6 @@ class StereoMasterGUI(QMainWindow):
                 if base_:
                     selected_bases.add(base_)
 
-        # Guardar filtro actualmente seleccionado
         current_filter = self.filter_combo.currentText()
 
         self.all_items_data = []
@@ -3081,7 +2928,7 @@ class StereoMasterGUI(QMainWindow):
                 bn = os.path.basename(p)
                 bn_noext, _ = os.path.splitext(bn)
                 if "_splatted" in bn_noext and "_inpainting" not in bn_noext:
-                    # e.g.  someVideo_splatted.mp4
+          
                     base_ = bn_noext.replace("_splatted", "")                  
                     splat_dict[base_] = p
                     
@@ -3099,27 +2946,19 @@ class StereoMasterGUI(QMainWindow):
                         base_ = base_.replace("_anaglyph", "")
                         anaglyph_dict[base_] = p       
 
-        # --- 6) Inpainted ---
-        #     Check both "_splatted_inpainting_results_" and "_splatted_inpainting"
-        #     so it catches e.g. "myvideo_splatted_inpainting_results_fsbs_x264.mp4"
-        #     or "myvideo_splatted_inpainting.mp4"
         for e_ in exts:
             for p in glob.glob(os.path.join(self.inpainting_out_edit.text(), e_)):
                 bn = os.path.basename(p)
                 bn_noext, _ = os.path.splitext(bn)
-
-                if "_splatted_inpainting_results_" in bn_noext:
-                    # e.g. base_ = bn_noext.split("_splatted_inpainting_results_", 1)[0]
+                if "_splatted_inpainting_results_" in bn_noext:  
                     base_ = bn_noext.split("_splatted_inpainting_results_", 1)[0]
                     inpaint_dict[base_] = p
                 elif "_splatted_inpainting" in bn_noext:
-                    # fallback for older naming
                     base_ = bn_noext.split("_splatted_inpainting", 1)[0]
                     inpaint_dict[base_] = p
 
-        # We do NOT scan 'dir_completed_merged' to keep them out of the main list
 
-        # --- Combine all base_ names and build self.all_items_data ---
+
         all_bases = set(
             list(orig_dict.keys()) +
             list(depth1_dict.keys()) +
@@ -3291,14 +3130,8 @@ class StereoMasterGUI(QMainWindow):
 
 
     def do_scene_detect_with_threshold(self, threshold, video_path=None):
-        """
-        Lanza SceneDetect para el video especificado:
-          - Si 'video_path' está presente, lo usa.
-          - Si 'video_path' es None, usa self.selected_video_path.
-        """
         import sys, os
 
-        # 1) Determinar la ruta del video que vas a usar
         if video_path is None:
             if not self.selected_video_path:
                 self.log("[ERROR] => No selected_video_path for scene detect.")
@@ -3359,12 +3192,12 @@ class StereoMasterGUI(QMainWindow):
         Se llama cuando pasan 150ms sin que el usuario mueva el slider.
         """
         final_value = self.pending_slider_value
-        # Aplica keyframe interpolation/exact
+
         if not self.enable_interpolation_local:
             self.apply_keyframe_if_exists(final_value)
         else:
             self.apply_interpolation_local(final_value)
-        # Y ahora sí mostramos la preview
+
         self.show_preview(final_value)
 
 
@@ -3391,20 +3224,19 @@ class StereoMasterGUI(QMainWindow):
             return
 
         frames_sorted = sorted([int(k) for k in kf_dict.keys()])
-        # 1) Debajo del primer keyframe
+
         if frame_idx <= frames_sorted[0]:
             f0 = frames_sorted[0]
             kf_ = kf_dict[str(f0)]
             self.set_sliders_from_kf(kf_)
             return
-        # 2) Encima del último keyframe
+
         if frame_idx >= frames_sorted[-1]:
             f0 = frames_sorted[-1]
             kf_ = kf_dict[str(f0)]
             self.set_sliders_from_kf(kf_)
             return
 
-        # 3) Buscar el par de keyframes que encierran frame_idx
         left_f = frames_sorted[0]
         right_f= frames_sorted[-1]
         for i in range(len(frames_sorted)-1):
@@ -3421,8 +3253,6 @@ class StereoMasterGUI(QMainWindow):
             return
 
         ratio = (frame_idx - left_f)/ float(right_f - left_f)
-
-        # 4) default_val => fallback con valores actuales (por si un keyframe no define algo)
         default_val = {
             "disp_value": self.disp_value,
             "convergence": self.conv_value,
@@ -3432,9 +3262,6 @@ class StereoMasterGUI(QMainWindow):
             "dilate_v_value": self.dilate_v_value,
             "blur_ksize_value": self.blur_ksize_value,
             "blur_sigma_value": self.blur_sigma_value,
-            # Polylines:
-            "stereo_offset_exponent_value": self.poly_exponent,
-            "fill_technique_value": self.poly_fill_tech,
             "warp_exponent_base": self.warp_exponent_base
         }
 
@@ -3446,14 +3273,12 @@ class StereoMasterGUI(QMainWindow):
             lv = left_valset.get(p_, default_val[p_])
             rv = right_valset.get(p_, default_val[p_])
 
-            # 5) Interpolar => si ambos son numéricos, se interpola;
     
             if isinstance(lv, (int,float)) and isinstance(rv, (int,float)):
                 val = lv + (rv - lv)* ratio
             elif isinstance(lv, str) and isinstance(rv, str):
-                val = lv  # elegimos la versión "left"
+                val = lv  
             else:
-                # fallback => coge la izq
                 val = lv
 
             params_inter[p_] = val
@@ -3563,7 +3388,7 @@ class StereoMasterGUI(QMainWindow):
         Restaura el preview_bri a 1.0
         """
         self.preview_bri = 1.0
-        self.slider_preview_bri.setValue(100)  # 100 equivale a factor 1.0
+        self.slider_preview_bri.setValue(100)  
         self.lbl_preview_bri_val.setText("1.00")
         self.show_preview(self.current_frame_idx)
 
@@ -3572,17 +3397,52 @@ class StereoMasterGUI(QMainWindow):
         Restaura el preview_gamma a 1.0
         """
         self.preview_gamma = 1.0
-        self.slider_preview_gamma.setValue(100)  # 100 equivale a factor 1.0
+        self.slider_preview_gamma.setValue(100) 
         self.lbl_preview_gamma_val.setText("1.00")
         self.show_preview(self.current_frame_idx)
 
 
+    def on_save_video_settings_clicked(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            QMessageBox.warning(self, "No Video", "No video is selected.")
+            return
+
+        dd = item.data(Qt.UserRole)
+        if not dd:
+            QMessageBox.warning(self, "No Data", "Internal error: no data in item.")
+            return
+
+        base_ = dd.get("base_name", "")
+        if not base_:
+            QMessageBox.warning(self, "No Base Name", "Internal error: base_name missing.")
+            return
+
+        saved_params = {
+            "disp_value": self.disp_value,
+            "conv_value": self.conv_value,
+            "brightness_value": self.brightness_value,
+            "gamma_value": self.gamma_value,
+            "dilate_h_value": self.dilate_h_value,
+            "dilate_v_value": self.dilate_v_value,
+            "blur_ksize_value": self.blur_ksize_value,
+            "blur_sigma_value": self.blur_sigma_value,
+            "warp_exponent_base": self.warp_exponent_base
+        }
+
+        old_keyframes = {}
+        if base_ in self.video_params:
+            old_keyframes = self.video_params[base_].get("keyframes", {})
+
+        self.video_params[base_] = saved_params
+        self.video_params[base_]["keyframes"] = old_keyframes
+
+        self.save_params()
+
+        self.log(f"[SAVE SETTINGS] => Saved slider params for '{base_}' => {saved_params}")
+
 
     def is_video_higher_than_1080p(self, video_path):
-        """
-        Returns True if the video exceeds 1080p (height > 1080 or width > 1920),
-        or False otherwise. If there's an error opening the file, returns False.
-        """
         import os
         if not os.path.isfile(video_path):
             return False
@@ -3602,26 +3462,15 @@ class StereoMasterGUI(QMainWindow):
 
          
     def show_preview(self, frame_idx):
-        """
-        Un solo checkbox activo a la vez. Si 'orig' está marcado => muestra original
-        Si 'depth' está marcado => muestra video depth
-        Si 'splatted' => muestra video splatted
-        Si 'inpaint' => muestra video inpaint
-        Si 'polylines' => genera anaglifo con polylines + la depth elegida en combo
-        Si 'anaglyph' => anaglifo con forward warp + la depth elegida en combo
-        Si no existe el archivo => pantalla negra + mensaje.
-        Si la combo depth es "No Depth" => pantalla negra + mensaje.
-        """
 
         try:
-            # Primero comprobamos rango de frame_idx
             if frame_idx < 0 or frame_idx >= self.num_frames:
                 self.log("[WARN] => frame_idx out of range.")
                 return
 
-            # Miramos qué checkbox está activo:
+
             if self.chk_orig.isChecked():
-                # => Mostrar video original, si existe
+
                 if not self.vid_original:
                     self.log("[WARN] => No vid_original to show in 'Orig' mode.")
                     return
@@ -3631,20 +3480,17 @@ class StereoMasterGUI(QMainWindow):
                     self.log("[ERROR] => can't read original frame.")
                     return
 
-                # Ajuste bri/gamma
                 fr_ = np.clip(fr_ * self.preview_bri, 0, 1)
                 fr_ = fr_ ** (1.0 / max(self.preview_gamma, 1e-5))
                 self.show_image_in_label(fr_, self.label_preview)
                 return
 
             elif self.chk_depth.isChecked():
-                # => Mostrar video depth que esté en el combo (Depth1/Depth2/Merged)
                 dfr = self.get_depth_video_frame(frame_idx)
                 if dfr is None:
                     self.log("[WARN] => No depth video for that choice or 'No Depth' selected.")
                     return
 
-                # Puede venir en gris => convertir a RGB
                 if dfr.ndim == 2:
                     dfr = cv2.cvtColor(dfr, cv2.COLOR_GRAY2RGB)
 
@@ -3655,7 +3501,7 @@ class StereoMasterGUI(QMainWindow):
                 return
 
             elif self.chk_splatted.isChecked():
-                # => Mostrar video splatted, si existe
+
                 if not self.vid_splatted:
                     self.log("[WARN] => No splatted video loaded.")
                     return
@@ -3672,7 +3518,7 @@ class StereoMasterGUI(QMainWindow):
                 return
 
             elif self.chk_inpaint.isChecked():
-                # => Mostrar video inpaint, si existe
+
                 if not self.vid_inpainted:
                     self.log("[WARN] => No inpainted video loaded.")
                     return
@@ -3688,39 +3534,7 @@ class StereoMasterGUI(QMainWindow):
                 self.show_image_in_label(fr_, self.label_preview)
                 return
 
-            elif self.chk_polylines.isChecked():
-                # => Polylines => requiere original + depth
-                if not self.vid_original:
-                    self.log("[WARN] => Polylines: No vid_original for left-eye.")
-                    return
-
-                fr_orig = self.get_video_frame(self.vid_original, frame_idx)
-                if fr_orig is None:
-                    self.log("[WARN] => can't read original.")
-                    return
-
-                depth_ = self.get_depth_gray(frame_idx)
-                if depth_ is None:
-                    self.log("[WARN] => Polylines: No depth selected or no depth file.")
-                    return
-
-                # Genera “right eye” usando polylines
-                right_eye = self.apply_polylines(fr_orig, depth_)
-
-                # Anaglifo: R = original left, G/B = right
-                anag = np.zeros_like(fr_orig)
-                anag[..., 0] = fr_orig[..., 0]
-                anag[..., 1] = right_eye[..., 1]
-                anag[..., 2] = right_eye[..., 2]
-
-                anag = np.clip(anag * self.preview_bri, 0, 1)
-                anag = anag ** (1.0 / max(self.preview_gamma, 1e-5))
-
-                self.show_image_in_label(anag, self.label_preview)
-                return
-
             elif self.chk_anaglyph.isChecked():
-                # => Anaglifo => requiere original + depth
                 if not self.vid_original:
                     self.log("[WARN] => Anaglyph: No vid_original for left-eye.")
                     return
@@ -3750,7 +3564,6 @@ class StereoMasterGUI(QMainWindow):
                 return
 
             else:
-                # Si ningún checkbox está marcado => no hacemos nada
                 self.log("[WARN] => No checkbox active.")
                 return
 
@@ -3780,17 +3593,16 @@ class StereoMasterGUI(QMainWindow):
         if choice == "No Depth":
             return None
 
-        # --- 1) Leemos el frame de profundidad (raw) según la opción ---
         if choice == "Depth1":
-            # depth1
+
             dframe = self.get_video_frame(self.vid_depth, frame_idx)
 
         elif choice == "Depth2":
-            # depth2
+
             dframe = self.get_video_frame(self.vid_depth2, frame_idx)
 
         elif choice == "Merged":
-            # Fusión “al vuelo” (ignorando self.vid_depth_merged):
+
             if not (self.vid_depth and self.vid_depth2):
                 return None
             if frame_idx >= len(self.vid_depth) or frame_idx >= len(self.vid_depth2):
@@ -3802,13 +3614,11 @@ class StereoMasterGUI(QMainWindow):
             except:
                 return None
 
-            # Convertimos a gris
             if d1_.ndim == 3 and d1_.shape[-1] == 3:
                 d1_ = d1_.mean(axis=-1)
             if d2_.ndim == 3 and d2_.shape[-1] == 3:
                 d2_ = d2_.mean(axis=-1)
 
-            # Normalizamos cada depth
             mn1, mx1 = d1_.min(), d1_.max()
             if (mx1 - mn1) > 1e-5:
                 d1_ = (d1_ - mn1)/(mx1 - mn1)
@@ -3821,29 +3631,22 @@ class StereoMasterGUI(QMainWindow):
             else:
                 d2_[:] = 0.0
 
-            # Fusión
             a_ = self.fusion_alpha / 100.0
             merged_ = d1_*(1-a_) + d2_*a_
             dframe = merged_
 
         else:
-            # Por si acaso
             return None
 
-        # Si no hay frame leído, salimos
         if dframe is None:
             return None
-
-        # --- 2) Convertir a gris si no lo está (por seguridad) ---
-        #    (En Merged ya lo convertimos; en Depth1/Depth2 no siempre).
         if dframe.ndim == 3 and dframe.shape[-1] == 3:
             dframe = dframe.mean(axis=-1)
 
-        # --- 4) Aplicar brillo/gamma de la profundidad (sliders “Depth Bri/Gam”) ---
+ 
         dframe = np.clip(dframe * self.brightness_value, 0, 1)
         dframe = dframe ** (1.0 / max(self.gamma_value, 1e-5))
 
-        # --- 5) Aplicar dilate/blur (sliders “DilateH/V, BlurK/Sigma”) ---
         dframe = apply_depth_preprocess(
             dframe,
             self.dilate_h_value,
@@ -3852,13 +3655,9 @@ class StereoMasterGUI(QMainWindow):
             self.blur_sigma_value
         )
 
-        # --- 6) Replicar a 3 canales para mostrarlo en color ---
+
         depth_rgb = np.stack([dframe]*3, axis=-1)  # [H,W,3]
         return depth_rgb
-
-
-
-
 
     def get_depth_gray(self, frame_idx):
         """
@@ -3869,58 +3668,20 @@ class StereoMasterGUI(QMainWindow):
         dfr = self.get_depth_video_frame(frame_idx)
         if dfr is None:
             return None
-
-        # Pasar a gris si está en 3 canales
         if dfr.ndim == 3 and dfr.shape[-1] == 3:
             dfr = dfr.mean(axis=-1)
-
-        # Normalización
         mn, mx = dfr.min(), dfr.max()
         if (mx - mn) > 1e-6:
             dfr = (dfr - mn)/(mx - mn)
         else:
             dfr = np.zeros_like(dfr, dtype=np.float32)
 
-        # Optional: brightness/gamma con tus sliders de depth
         dfr = np.clip(dfr * self.brightness_value, 0,1)
         dfr = dfr ** (1.0 / max(self.gamma_value, 1e-5))
 
-        # dilate/blur => apply_depth_preprocess
         dfr = apply_depth_preprocess(dfr, self.dilate_h_value, self.dilate_v_value,
                                      self.blur_ksize_value, self.blur_sigma_value)
         return dfr
-        
-
-    def apply_polylines(self, left_eye, depth_gray):
-        """
-        Genera la imagen 'right_eye' con polylines. 
-        left_eye => [H,W,3], float32 [0..1]
-        depth_gray => [H,W], float32 [0..1]
-        Devuelve right_eye => [H,W,3], float32 [0..1].
-        """
-        disp_frame = (depth_gray*2.0 - 1.0)*self.disp_value + self.conv_value
-
-        d_min, d_max = disp_frame.min(), disp_frame.max()
-        if (d_max - d_min) < 1e-9:
-            disp_norm = np.zeros_like(disp_frame, dtype=np.float32)
-        else:
-            disp_norm = ((disp_frame - d_min)/(d_max - d_min)).astype(np.float32)
-
-        left_u8 = (left_eye*255).astype(np.uint8)
-
-        try:
-            right_u8 = apply_stereo_divergence_polylines(
-                original_image= left_u8,
-                normalized_depth= disp_norm,
-                divergence_px= self.disp_value,
-                separation_px= self.conv_value,
-                stereo_offset_exponent= self.poly_exponent,
-                fill_technique= self.poly_fill_tech
-            )
-            return right_u8.astype(np.float32)/255.0
-        except Exception as e:
-            self.log(f"[ERROR] polylines => {e}")
-            return left_eye  # fallback
             
             
     def apply_forward_warp(self, left_eye, depth_gray):
@@ -3968,8 +3729,6 @@ class StereoMasterGUI(QMainWindow):
 
     def on_downscale_inpaint_changed(self, state):
         self.downscale_inpainting = (state == Qt.Checked)
-        # If downscale is True, we force tile=1 and disable tile spinbox
-        #   so the user cannot raise it
         if self.downscale_inpainting:
             self.spin_inpaint_tile_batch.setValue(1)
             self.spin_inpaint_tile_batch.setDisabled(True)
@@ -3978,135 +3737,47 @@ class StereoMasterGUI(QMainWindow):
 
     def on_mask_dilation_changed(self, value):
         self.mask_dilation_value = value
+        
+        
+    def update_save_button_text(self):
 
-    def on_mask_blur_changed(self, new_value):
-        # new_value = valor actual del SpinBox.
-        # self.mask_blur_value = valor anterior que guardamos nosotros.
+        item = self.list_widget.currentItem()
+        if not item:
+            self.btn_save_video_settings.setText("Save Settings (No video selected)")
+            self.btn_save_video_settings.setEnabled(False)
+            return
 
-        # Decidir si el usuario sube o baja
-        going_down = (new_value < self.mask_blur_value)
+        dd = item.data(Qt.UserRole)
+        if not dd:
+            self.btn_save_video_settings.setText("Save Settings (No video selected)")
+            self.btn_save_video_settings.setEnabled(False)
+            return
 
-        # Forzar que sea impar:
-        if new_value % 2 == 0:  # es par
+        base_name = dd.get("base_name", "")
+        if not base_name:
+            self.btn_save_video_settings.setText("Save Settings (No video selected)")
+            self.btn_save_video_settings.setEnabled(False)
+            return
+
+        self.btn_save_video_settings.setText(f"Save Settings for {base_name}")
+        self.btn_save_video_settings.setEnabled(True)
+    
+
+    def on_mask_blur_changed(self, new_value):  
+        going_down = (new_value < self.mask_blur_value)  
+        if new_value % 2 == 0:  
             if going_down:
-                new_value -= 1  # bajamos uno más
+                new_value -= 1 
             else:
-                new_value += 1  # subimos uno
-
-        # Evitar que baje de 1 (por si restamos de 1 y se va a 0)
+                new_value += 1   
         if new_value < 1:
             new_value = 1
-
-        # Bloqueamos la señal para no caer en recursividad de valueChanged
         self.spin_mask_blur.blockSignals(True)
         self.spin_mask_blur.setValue(new_value)
         self.spin_mask_blur.blockSignals(False)
-
-        # Guardamos el valor en nuestra variable
         self.mask_blur_value = new_value
-
-
-
         
-    def do_polylines_sbs(self):
-        if not self.selected_video_path:
-            QMessageBox.warning(self, "Attention", "No video selected.")
-            return
-
-        # Escoger depth (Depth1, Depth2, Merged) según self.selected_splat_depth
-        if self.selected_splat_depth == "Depth1":
-            depth_path = self.selected_depth_path
-        elif self.selected_splat_depth == "Depth2":
-            depth_path = self.selected_depth_path2
-        else:
-            depth_path = self.selected_depth_merged
-
-        if not depth_path or not os.path.isfile(depth_path):
-            QMessageBox.warning(self, "Attention", "Depth file not found.")
-            return
-
-        base_ = os.path.splitext(os.path.basename(self.selected_video_path))[0]
-        out_path = os.path.join(self.output_splattings_edit.text(), base_+"_polylines_sbs.mp4")
-
-        # 1) Generar JSON de keyframes si existe
-        keyf_json_path = ""
-        if base_ in self.video_params and "keyframes" in self.video_params[base_]:
-            kf_dict = self.video_params[base_]["keyframes"]
-            if kf_dict:
-                # igual que do_splatting:
-                real_dict = {}
-                for k,v in kf_dict.items():
-                    try:
-                        fr_int = int(k)
-                        real_dict[fr_int] = v
-                    except:
-                        pass
-                if real_dict:
-                    keyf_json_path = f"temp_keyframes_{base_}.json"
-                    try:
-                        with open(keyf_json_path, "w", encoding="utf-8") as f:
-                            json.dump({base_: real_dict}, f, indent=2)
-                        self.log(f"[INFO] => Keyframes saved => {keyf_json_path}")
-                    except Exception as e:
-                        self.log(f"[ERROR] => Could not save keyframes => {e}")
-                        keyf_json_path = ""
-
-        # 2) Construir el comando a tu script => e.g. "depth_splatting.py" con --generate_stereo
-        cmd = [
-                sys.executable, "depth_splatting.py",
-                "--single_video", self.selected_video_path,
-                "--input_depth_maps", os.path.dirname(depth_path),
-                "--output_splatted", self.inpainting_out_edit.text(),
-                "--max_disp", str(self.disp_value),
-                "--convergence", str(self.conv_value),
-                "--depth_brightness_value", str(self.brightness_value),
-                "--depth_gamma_value", str(self.gamma_value),
-                "--stereo_offset_exponent", str(self.poly_exponent),
-                "--dilate_h", str(self.dilate_h_value),
-                "--dilate_v", str(self.dilate_v_value),
-                "--blur_ksize", str(self.blur_ksize_value),
-                "--blur_sigma", str(self.blur_sigma_value),
-                "--generate_stereo", "True",  # Tells script to create a stereo pair via polylines
-                "--fill_technique", self.poly_fill_tech,          
-                "--encoder", self.output_encoder,
-                # half-SBS or full-SBS
-                "--sbs_mode", "half" if self.sbs_mode == "HSBS" else "full"
-            ]
-                    
-        depth_mode_map = {
-            "8-bit MP4": "mp4",
-            "16-bit EXR seq": "exr16",
-            "32-bit EXR seq": "exr32"
-        }
-        real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
-        cmd.extend(["--depth_output_mode", real_mode])           
-        cmd.append("--warp_exponent_base")
-        cmd.append(str(self.warp_exponent_base))    
-
-        if keyf_json_path:
-            cmd.append("--keyframes_json")
-            cmd.append(keyf_json_path)
-
-         
-        self.polylines_sbs_worker = SubprocessWorker(cmd)
-        self.polylines_sbs_worker.lineReady.connect(self.log)
-        self.polylines_sbs_worker.finishedSignal.connect(self.on_polylines_sbs_finished)
-        self.current_batch_worker = self.polylines_sbs_worker
-        self.batch_cancelled = False
-        self.polylines_sbs_worker.start()
-
-    def on_polylines_sbs_finished(self, success):
-        self.current_batch_worker = None
-        if success:
-            self.log("[OK] => Polylines SBS => done => refresh")
-            self.scan_and_list_videos()
-        else:
-            self.log("[ERROR] => Polylines SBS => fail")
             
-
-    ###########################################################
-    # GENERATE DEPTH1
-    ###########################################################
 
     def on_depth_generated(self, success):
         self.current_batch_worker=None
@@ -4116,25 +3787,23 @@ class StereoMasterGUI(QMainWindow):
         else:
             self.log("[ERROR] => Depth => fail")
 
-    ###########################################################
-    # BATCH
-    ###########################################################
+
     def batch_generate_depth_selected(self):
-        sel_items=self.list_widget.selectedItems()
+        sel_items = self.list_widget.selectedItems()
         if not sel_items:
             QMessageBox.information(self, "Info", "No items selected for batch depth.")
             return
-        self.batch_depth_queue=[]
+        self.batch_depth_queue = []
         for it in sel_items:
-            dd= it.data(Qt.UserRole)
+            dd = it.data(Qt.UserRole)
             if dd:
                 self.batch_depth_queue.append(dd)
-        self.batch_depth_idx=0
+        self.batch_depth_idx = 0
         self.batch_cancelled = False
         self.batch_progress_bar.setValue(0)
-        self.batch_progress_bar.setRange(0,len(self.batch_depth_queue))
+        self.batch_progress_bar.setRange(0, len(self.batch_depth_queue))
         self.log(f"[INFO] => Starting BATCH depth => {len(self.batch_depth_queue)} items.")
-        self.batch_depth_phase=0
+        self.batch_depth_phase = 0
         self.process_next_depth_in_queue()
 
     def process_next_depth_in_queue(self):
@@ -4144,7 +3813,6 @@ class StereoMasterGUI(QMainWindow):
         if self.batch_depth_idx >= len(self.batch_depth_queue):
             self.log("[INFO] => batch depth => done.")
             return
-
         dd = self.batch_depth_queue[self.batch_depth_idx]
         base_ = dd.get("base_name", "")
         orig = dd.get("orig", "")
@@ -4154,27 +3822,44 @@ class StereoMasterGUI(QMainWindow):
             self.batch_progress_bar.setValue(self.batch_depth_idx)
             self.process_next_depth_in_queue()
             return
-
-        # ------------------------------
-        # 1) Decide output path for depth
-        # ------------------------------
         src_choice = self.combo_batch_depth_source.currentText()
+        depth_mode_map = {
+            "8-bit MP4": "mp4",
+            "16-bit EXR seq": "exr16",
+            "32-bit EXR seq": "exr32"
+        }
+        real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
         if src_choice == "DepthCrafter":
-            out_path = os.path.join(self.pre_depth_edit.text(), base_ + "_depth.mp4")
-        elif src_choice == "VDA":
-            out_path = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth.mp4")
-        else:
-            # "Both": Depth1 then Depth2 in two steps
-            if self.batch_depth_phase == 0:
+            if real_mode == "mp4":
                 out_path = os.path.join(self.pre_depth_edit.text(), base_ + "_depth.mp4")
             else:
+                out_path = os.path.join(self.pre_depth_edit.text(), base_ + "_depth_" + real_mode)
+        elif src_choice == "VDA":
+            if real_mode == "mp4":
                 out_path = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth.mp4")
-
-        # ------------------------------
-        # 2) Check if file already exists & checkbox not checked => ask
-        # ------------------------------
-        if (not self.check_overwrite_depth.isChecked()) and os.path.isfile(out_path):
-            from PyQt5.QtWidgets import QMessageBox
+            else:
+                out_path = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth_" + real_mode)
+        else:
+            if self.batch_depth_phase == 0:
+                if real_mode == "mp4":
+                    out_path = os.path.join(self.pre_depth_edit.text(), base_ + "_depth.mp4")
+                else:
+                    out_path = os.path.join(self.pre_depth_edit.text(), base_ + "_depth_" + real_mode)
+            else:
+                if real_mode == "mp4":
+                    out_path = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth.mp4")
+                else:
+                    out_path = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth_" + real_mode)
+        file_exists = False
+        if real_mode == "mp4":
+            if os.path.isfile(out_path):
+                file_exists = True
+        else:
+            if os.path.isdir(out_path):
+                import glob
+                if glob.glob(os.path.join(out_path, "*.exr")):
+                    file_exists = True
+        if (not self.check_overwrite_depth.isChecked()) and file_exists:
             box = QMessageBox(self)
             box.setWindowTitle("Overwrite Depth?")
             msg = (
@@ -4182,29 +3867,34 @@ class StereoMasterGUI(QMainWindow):
                 "Overwrite?\n\n"
                 "Yes => Overwrite only this item\n"
                 "No => Skip this item\n"
-                "Yes to all => Do not ask again and overwrite all"
+                "Yes to all => Overwrite all remaining\n"
+                "No to all => Skip all remaining\n"
             )
             box.setText(msg)
             yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-            no_btn  = box.addButton("No",  QMessageBox.NoRole)
-            all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
+            no_btn = box.addButton("No", QMessageBox.NoRole)
+            yes_all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
+            no_all_btn = box.addButton("No to all", QMessageBox.RejectRole)
             box.exec_()
-
             if box.clickedButton() == no_btn:
                 self.log(f"[INFO] => skipping {base_} => user chose no overwrite.")
                 self.batch_depth_idx += 1
                 self.batch_progress_bar.setValue(self.batch_depth_idx)
                 self.process_next_depth_in_queue()
                 return
-            elif box.clickedButton() == all_btn:
+            elif box.clickedButton() == yes_all_btn:
                 self.log("[INFO] => user chose 'Yes to all' => enabling Overwrite Depth checkbox.")
                 self.check_overwrite_depth.setChecked(True)
-            # if it's yes_btn => overwrite just this item
-
-        # ------------------------------
-        # 3) Original logic (unchanged)
-        # ------------------------------
+            elif box.clickedButton() == no_all_btn:
+                self.log("[INFO] => user chose 'No to all' => skipping all remaining.")
+                while self.batch_depth_idx < len(self.batch_depth_queue):
+                    self.batch_depth_idx += 1
+                    self.batch_progress_bar.setValue(self.batch_depth_idx)
+                return
         if src_choice == "DepthCrafter":
+            clip_params = self.video_params.get(base_, {})
+            orig_bri_val = clip_params.get("orig_brightness", self.orig_brightness)
+            orig_gam_val = clip_params.get("orig_gamma", self.orig_gamma)
             cmd = [
                 sys.executable, "depth_splatting.py",
                 "--single_video", orig,
@@ -4213,9 +3903,8 @@ class StereoMasterGUI(QMainWindow):
                 "--max_disp", "0",
                 "--convergence", "0",
                 "--depth_only", "True",
-                "--stereo_offset_exponent", str(self.poly_exponent),
-                "--orig_brightness_value", str(self.orig_brightness),
-                "--orig_gamma_value", str(self.orig_gamma),
+                "--orig_brightness_value", str(orig_bri_val),
+                "--orig_gamma_value", str(orig_gam_val),
                 "--max_res", str(self.crafter_maxres_value),
                 "--window_size", str(self.crafter_window),
                 "--overlap", str(self.crafter_overlap),
@@ -4223,23 +3912,21 @@ class StereoMasterGUI(QMainWindow):
                 "--guidance_scale", f"{self.crafter_guidance_scale:.1f}",
                 "--seed", str(self.crafter_seed),
             ]
-            
-            depth_mode_map = {
-                "8-bit MP4": "mp4",
-                "16-bit EXR seq": "exr16",
-                "32-bit EXR seq": "exr32"
-            }
-            real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
+            cmd.append("--crop_border_px")
+            cmd.append(str(self.crop_border_px))
 
+            cmd.append("--inpaintRadius")
+            cmd.append(str(self.inpaintRadius))
+            cmd.append("--max_small_hole_area")
+            cmd.append(str(self.max_small_hole_area))
             cmd.extend(["--depth_output_mode", real_mode])
             cmd.append("--warp_exponent_base")
-            cmd.append(str(self.warp_exponent_base))             
+            cmd.append(str(self.warp_exponent_base))
             self.batch_depth_worker = SubprocessWorker(cmd)
             self.current_batch_worker = self.batch_depth_worker
             self.batch_depth_worker.lineReady.connect(self.log)
             self.batch_depth_worker.finishedSignal.connect(self.on_depth_generated_batch_single)
             self.batch_depth_worker.start()
-
         elif src_choice == "VDA":
             cmd = [
                 sys.executable, "run.py",
@@ -4251,30 +3938,21 @@ class StereoMasterGUI(QMainWindow):
                 "--input_size", str(self.vda_input_size),
                 "--encoder", str(self.vda_encoder),
             ]
-            depth_mode_map = {
-                "8-bit MP4": "mp4",
-                "16-bit EXR seq": "exr16",
-                "32-bit EXR seq": "exr32"
-            }
-            real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
             cmd.extend(["--depth_output_mode", real_mode])
-
-            
             if self.vda_use_fp16:
                 cmd.append("--use_fp16")
-
             if self.vda_use_cudnn:
                 cmd.append("--use_cudnn_benchmark")
-
             self.batch_depth_worker = SubprocessWorker(cmd)
             self.current_batch_worker = self.batch_depth_worker
             self.batch_depth_worker.lineReady.connect(self.log)
             self.batch_depth_worker.finishedSignal.connect(self.on_depth_generated_batch_single)
             self.batch_depth_worker.start()
-
         else:
-            # "Both": Depth1 then Depth2 in two steps
             if self.batch_depth_phase == 0:
+                clip_params = self.video_params.get(base_, {})
+                orig_bri_val = clip_params.get("orig_brightness", self.orig_brightness)
+                orig_gam_val = clip_params.get("orig_gamma", self.orig_gamma)
                 cmd = [
                     sys.executable, "depth_splatting.py",
                     "--single_video", orig,
@@ -4282,28 +3960,26 @@ class StereoMasterGUI(QMainWindow):
                     "--output_splatted", "./temp_splatted",
                     "--max_disp", "0",
                     "--convergence", "0",
-                    "--depth_only", "True",  
-                    "--stereo_offset_exponent", str(self.poly_exponent),                    
-                    "--orig_brightness_value", str(self.orig_brightness),
-                    "--orig_gamma_value", str(self.orig_gamma),
-                    "--max_res", str(self.crafter_maxres_value), 
+                    "--depth_only", "True",
+                    "--orig_brightness_value", str(orig_bri_val),
+                    "--orig_gamma_value", str(orig_gam_val),
+                    "--max_res", str(self.crafter_maxres_value),
                     "--window_size", str(self.crafter_window),
                     "--overlap", str(self.crafter_overlap),
                     "--num_denoising_steps", str(self.crafter_denoising_steps),
                     "--guidance_scale", f"{self.crafter_guidance_scale:.1f}",
                     "--seed", str(self.crafter_seed),
                 ]
-                
-                depth_mode_map = {
-                    "8-bit MP4": "mp4",
-                    "16-bit EXR seq": "exr16",
-                    "32-bit EXR seq": "exr32"
-                }
-                real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
+                cmd.append("--crop_border_px")
+                cmd.append(str(self.crop_border_px))
 
-                cmd.extend(["--depth_output_mode", real_mode])              
+                cmd.append("--inpaintRadius")
+                cmd.append(str(self.inpaintRadius))
+                cmd.append("--max_small_hole_area")
+                cmd.append(str(self.max_small_hole_area))
+                cmd.extend(["--depth_output_mode", real_mode])
                 cmd.append("--warp_exponent_base")
-                cmd.append(str(self.warp_exponent_base)) 
+                cmd.append(str(self.warp_exponent_base))
                 self.batch_depth_worker = SubprocessWorker(cmd)
                 self.current_batch_worker = self.batch_depth_worker
                 self.batch_depth_worker.lineReady.connect(self.log)
@@ -4314,32 +3990,23 @@ class StereoMasterGUI(QMainWindow):
                     sys.executable, "run.py",
                     "--input_video", orig,
                     "--output_dir", self.pre_depth2_edit.text(),
-                    "--max_len", "-1", "--target_fps", "-1",
-                    "--max_res", str(self.vda_maxres_value),  
+                    "--max_len", "-1",
+                    "--target_fps", "-1",
+                    "--max_res", str(self.vda_maxres_value),
                     "--input_size", str(self.vda_input_size),
                     "--encoder", str(self.vda_encoder),
                 ]
-                
-                depth_mode_map = {
-                    "8-bit MP4": "mp4",
-                    "16-bit EXR seq": "exr16",
-                    "32-bit EXR seq": "exr32"
-                }
-                real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
                 cmd.extend(["--depth_output_mode", real_mode])
-
-                
                 if self.vda_use_fp16:
                     cmd.append("--use_fp16")
-
                 if self.vda_use_cudnn:
                     cmd.append("--use_cudnn_benchmark")
-
                 self.batch_depth_worker = SubprocessWorker(cmd)
                 self.current_batch_worker = self.batch_depth_worker
                 self.batch_depth_worker.lineReady.connect(self.log)
                 self.batch_depth_worker.finishedSignal.connect(self.on_depth_generated_batch_phase2)
                 self.batch_depth_worker.start()
+
 
 
     def on_depth_generated_batch_single(self, success):
@@ -4387,6 +4054,7 @@ class StereoMasterGUI(QMainWindow):
 
 
     def batch_splat_selected(self):
+        self.skip_overwrite_splat = False
         sel_items= self.list_widget.selectedItems()
         if not sel_items:
             QMessageBox.information(self,"Info","No items selected for batch splat.")
@@ -4410,7 +4078,6 @@ class StereoMasterGUI(QMainWindow):
         if self.batch_splat_idx >= len(self.batch_splat_queue):
             self.log("[INFO] => batch splat => done.")
             return
-
         dd = self.batch_splat_queue[self.batch_splat_idx]
         base_ = dd.get("base_name", "")
         orig_ = dd.get("orig", "")
@@ -4420,25 +4087,14 @@ class StereoMasterGUI(QMainWindow):
             self.batch_progress_bar.setValue(self.batch_splat_idx)
             self.process_next_splat_in_queue()
             return
-
-     
-        if self.is_video_higher_than_1080p(orig_):
-            self.log(f"[WARN] => {base_} => resolution higher than 1080p => skipping this item.")
+        out_path = os.path.join(self.output_splattings_edit.text(), base_ + "_splatted.mp4")
+        if self.skip_overwrite_splat and os.path.isfile(out_path):
+            self.log(f"[INFO] => skip_overwrite_splat=True => skipping {base_} automatically.")
             self.batch_splat_idx += 1
             self.batch_progress_bar.setValue(self.batch_splat_idx)
             self.process_next_splat_in_queue()
             return
-
-        # ----------------------------------
-        # 1) Output path for the splatted file
-        # ----------------------------------
-        out_path = os.path.join(self.output_splattings_edit.text(), base_ + "_splatted.mp4")
-
-        # ----------------------------------
-        # 2) Overwrite check
-        # ----------------------------------
         if (not self.check_overwrite_splat.isChecked()) and os.path.isfile(out_path):
-            from PyQt5.QtWidgets import QMessageBox
             box = QMessageBox(self)
             box.setWindowTitle("Overwrite Splat?")
             msg = (
@@ -4446,26 +4102,31 @@ class StereoMasterGUI(QMainWindow):
                 "Overwrite?\n\n"
                 "Yes => Overwrite only this item\n"
                 "No => Skip this item\n"
-                "Yes to all => Do not ask again and overwrite all"
+                "Yes to all => Don't ask again (overwrite all)\n"
+                "No to all => Don't ask again (skip all overwrites)"
             )
             box.setText(msg)
             yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-            no_btn  = box.addButton("No",  QMessageBox.NoRole)
-            all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
+            no_btn = box.addButton("No", QMessageBox.NoRole)
+            yes_all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
+            no_all_btn = box.addButton("No to all", QMessageBox.RejectRole)
             box.exec_()
-
             if box.clickedButton() == no_btn:
-                self.log(f"[INFO] => skipping {base_} (user chose no).")
+                self.log(f"[INFO] => skipping {base_} => user chose no overwrite.")
                 self.batch_splat_idx += 1
                 self.batch_progress_bar.setValue(self.batch_splat_idx)
                 self.process_next_splat_in_queue()
                 return
-            elif box.clickedButton() == all_btn:
+            elif box.clickedButton() == yes_all_btn:
                 self.log("[INFO] => user chose 'Yes to all' => enabling Overwrite Splat checkbox.")
                 self.check_overwrite_splat.setChecked(True)
-            # if yes_btn => overwrite only this
-
-
+            elif box.clickedButton() == no_all_btn:
+                self.log("[INFO] => user chose 'No to all' => skipping all future overwrites for splat.")
+                self.skip_overwrite_splat = True
+                self.batch_splat_idx += 1
+                self.batch_progress_bar.setValue(self.batch_splat_idx)
+                self.process_next_splat_in_queue()
+                return
         spl_src = self.combo_batch_splat_source.currentText()
         if spl_src == "depth1":
             dep = dd.get("depth1", "")
@@ -4473,21 +4134,18 @@ class StereoMasterGUI(QMainWindow):
             dep = dd.get("depth2", "")
         else:
             dep = dd.get("depthf", "")
-
         if not dep or not os.path.isfile(dep):
             self.log(f"[WARN] => {base_} => no depth => skip.")
             self.batch_splat_idx += 1
             self.batch_progress_bar.setValue(self.batch_splat_idx)
             self.process_next_splat_in_queue()
             return
-
-        # Keyframes logic (unchanged):
         keyf_json_path = ""
         if base_ in self.video_params and "keyframes" in self.video_params[base_]:
             kf_dict = self.video_params[base_]["keyframes"]
             if kf_dict:
                 real_dict = {}
-                for k,v in kf_dict.items():
+                for k, v in kf_dict.items():
                     try:
                         key_int = int(k)
                         real_dict[key_int] = v
@@ -4502,21 +4160,29 @@ class StereoMasterGUI(QMainWindow):
                     except Exception as e:
                         self.log(f"[ERROR] => Could not save keyframes => {e}")
                         keyf_json_path = ""
-
+        clip_params = self.video_params.get(base_, {})
+        disp_val   = clip_params.get("disp_value", 20.0)
+        conv_val   = clip_params.get("conv_value", 0.0)
+        bri_val    = clip_params.get("brightness_value", 1.0)
+        gamma_val  = clip_params.get("gamma_value", 1.0)
+        dil_h_val  = clip_params.get("dilate_h_value", 4)
+        dil_v_val  = clip_params.get("dilate_v_value", 1)
+        blur_k_val = clip_params.get("blur_ksize_value", 3)
+        blur_s_val = clip_params.get("blur_sigma_value", 2.0)
+        warp_exp   = clip_params.get("warp_exponent_base", 1.414)
         cmd = [
             sys.executable, "depth_splatting.py",
             "--single_video", orig_,
             "--input_depth_maps", os.path.dirname(dep),
             "--output_splatted", self.output_splattings_edit.text(),
-            "--max_disp", str(self.disp_value),
-            "--convergence", str(self.conv_value),
-            "--depth_brightness_value", str(self.brightness_value),
-            "--depth_gamma_value", str(self.gamma_value),
-            "--dilate_h", str(self.dilate_h_value),
-            "--dilate_v", str(self.dilate_v_value),
-            "--blur_ksize", str(self.blur_ksize_value),
-            "--blur_sigma", str(self.blur_sigma_value),
-            "--stereo_offset_exponent", str(self.poly_exponent),
+            "--max_disp", str(disp_val),
+            "--convergence", str(conv_val),
+            "--depth_brightness_value", str(bri_val),
+            "--depth_gamma_value", str(gamma_val),
+            "--dilate_h", str(dil_h_val),
+            "--dilate_v", str(dil_v_val),
+            "--blur_ksize", str(blur_k_val),
+            "--blur_sigma", str(blur_s_val),
             "--process_length", "-1",
             "--max_res", str(self.depth_maxres_value),
             "--window_size", str(self.crafter_window),
@@ -4526,23 +4192,25 @@ class StereoMasterGUI(QMainWindow):
             "--guidance_scale", f"{self.crafter_guidance_scale:.1f}",
             "--seed", str(self.crafter_seed),
         ]
-        
+        cmd.append("--crop_border_px")
+        cmd.append(str(self.crop_border_px))
+
+        cmd.append("--inpaintRadius")
+        cmd.append(str(self.inpaintRadius))
+        cmd.append("--max_small_hole_area")
+        cmd.append(str(self.max_small_hole_area))
         depth_mode_map = {
             "8-bit MP4": "mp4",
             "16-bit EXR seq": "exr16",
             "32-bit EXR seq": "exr32"
         }
         real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
-
-        cmd.extend(["--depth_output_mode", real_mode])   
+        cmd.extend(["--depth_output_mode", real_mode])
         cmd.append("--warp_exponent_base")
-        cmd.append(str(self.warp_exponent_base)) 
+        cmd.append(str(warp_exp))
         if keyf_json_path:
             cmd.append("--keyframes_json")
             cmd.append(keyf_json_path)
-         
-        cmd.append("--warp_exponent_base")
-        cmd.append(str(self.warp_exponent_base)) 
         self.batch_splat_worker = SubprocessWorker(cmd)
         self.current_batch_worker = self.batch_splat_worker
         self.batch_splat_worker.lineReady.connect(self.log)
@@ -4565,20 +4233,25 @@ class StereoMasterGUI(QMainWindow):
         self.inpaint_threshold_batch = val
         self.save_depth_global_params()
 
+    def on_stereo_sliders_timeout(self):
+        self.show_preview(self.current_frame_idx)
+
+
     def batch_inpaint_selected(self):
-        sel_items= self.list_widget.selectedItems()
+        self.skip_overwrite_inpaint = False
+        sel_items = self.list_widget.selectedItems()
         if not sel_items:
-            QMessageBox.information(self,"Info","No items selected for batch inpaint.")
+            QMessageBox.information(self, "Info", "No items selected for batch inpaint.")
             return
-        self.batch_inpaint_queue=[]
+        self.batch_inpaint_queue = []
         for it in sel_items:
-            dd= it.data(Qt.UserRole)
+            dd = it.data(Qt.UserRole)
             if dd:
                 self.batch_inpaint_queue.append(dd)
-        self.batch_inpaint_idx=0
+        self.batch_inpaint_idx = 0
         self.batch_cancelled = False
         self.batch_progress_bar.setValue(0)
-        self.batch_progress_bar.setRange(0,len(self.batch_inpaint_queue))
+        self.batch_progress_bar.setRange(0, len(self.batch_inpaint_queue))
         self.log(f"[INFO] => Starting BATCH inpaint => {len(self.batch_inpaint_queue)} items.")
         self.process_next_inpaint_in_queue()
 
@@ -4589,264 +4262,203 @@ class StereoMasterGUI(QMainWindow):
         if self.batch_inpaint_idx >= len(self.batch_inpaint_queue):
             self.log("[INFO] => batch inpaint => done.")
             return
-
         dd = self.batch_inpaint_queue[self.batch_inpaint_idx]
         base_ = dd.get("base_name", "")
-        spl_  = dd.get("splatted", "")
+        spl_ = dd.get("splatted", "")
         orig_ = dd.get("orig", "")
-
         if not spl_ or not os.path.isfile(spl_):
             self.log(f"[WARN] => {base_} => no splatted => skip.")
             self.batch_inpaint_idx += 1
             self.batch_progress_bar.setValue(self.batch_inpaint_idx)
             self.process_next_inpaint_in_queue()
             return
-
-        # ------------------------------------------------
-        # 1) Output path for inpainted video
-        # ------------------------------------------------
-        out_name = f"{base_}_splatted_inpainting_results_{self.sbs_mode}_{self.output_encoder}.mp4"
-        out_path = os.path.join(self.inpainting_out_edit.text(), out_name)
-
-        # ------------------------------------------------
-        # 2) Overwrite check with "Yes/No/Yes to all"
-        # ------------------------------------------------
-        if (not self.check_overwrite_inpaint.isChecked()) and os.path.isfile(out_path):
-            from PyQt5.QtWidgets import QMessageBox
+        mode_str = self.inpaint_output_mode
+        real_mode = self._inpaint_output_mode_to_folder_or_mp4(mode_str)
+        out_path, file_exists = self._build_inpaint_output_path_and_check(base_, real_mode, self.inpainting_out_edit.text())
+        if self.skip_overwrite_inpaint and file_exists:
+            self.log(f"[INFO] => skip_overwrite_inpaint=True => skipping {base_} automatically.")
+            self.batch_inpaint_idx += 1
+            self.batch_progress_bar.setValue(self.batch_inpaint_idx)
+            self.process_next_inpaint_in_queue()
+            return
+        if file_exists and not self.check_overwrite_inpaint.isChecked():
             box = QMessageBox(self)
             box.setWindowTitle("Overwrite Inpaint?")
-            msg = (
-                f"Inpaint file already exists:\n{out_path}\n"
-                "Overwrite?\n\n"
-                "Yes => Overwrite only this item\n"
-                "No => Skip this item\n"
-                "Yes to all => Do not ask again and overwrite all"
-            )
+            msg = f"Inpaint file already exists:\n{out_path}\nOverwrite?\n\nYes => Overwrite only this item\nNo => Skip this item\nYes to all => Overwrite all remaining\nNo to all => Skip all remaining"
             box.setText(msg)
             yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-            no_btn  = box.addButton("No",  QMessageBox.NoRole)
-            all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
+            no_btn = box.addButton("No", QMessageBox.NoRole)
+            yes_all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
+            no_all_btn = box.addButton("No to all", QMessageBox.RejectRole)
             box.exec_()
-
             if box.clickedButton() == no_btn:
-                self.log(f"[INFO] => skipping {base_} (user chose no).")
+                self.log(f"[INFO] => skipping {base_} => user chose no overwrite.")
                 self.batch_inpaint_idx += 1
                 self.batch_progress_bar.setValue(self.batch_inpaint_idx)
                 self.process_next_inpaint_in_queue()
                 return
-            elif box.clickedButton() == all_btn:
+            elif box.clickedButton() == yes_all_btn:
                 self.log("[INFO] => user chose 'Yes to all' => enabling Overwrite Inpaint checkbox.")
                 self.check_overwrite_inpaint.setChecked(True)
-            # if yes_btn => overwrite only this
-
-
+            elif box.clickedButton() == no_all_btn:
+                self.log("[INFO] => user chose 'No to all' => skipping all remaining items.")
+                self.skip_overwrite_inpaint = True
+                self.batch_inpaint_idx += 1
+                self.batch_progress_bar.setValue(self.batch_inpaint_idx)
+                self.process_next_inpaint_in_queue()
+                return
+        out_cmd_mode = "mp4"
+        if real_mode in ["exr16", "exr32"]:
+            out_cmd_mode = real_mode
         cmd = [
             sys.executable, "inpainting.py",
             "--single_video", spl_,
             "--output_folder", self.inpainting_out_edit.text(),
             "--threshold_mask", f"{self.inpaint_threshold_batch:.3f}",
-            "--orig_video", orig_
+            "--orig_video", orig_,
+            "--use_color_ref", "True" if self.use_color_ref else "False",
+            "--partial_ref_frames", str(self.spin_partial_ref_frames.value()),
+            "--frames_chunk", str(self.spin_frames_chunk.value()),
+            "--downscale_inpainting", "True" if self.downscale_inpainting else "False",
+            "--dilation_mask", str(self.mask_dilation_value),
+            "--blur_mask", str(self.mask_blur_value),
+            "--num_inference_steps", str(self.inpaint_num_inference_steps_batch),
+            f"--tile_num={self.inpaint_tile_num_batch}",
+            "--encoder", self.output_encoder,
+            "--overlap", str(self.inpaint_overlap_batch),
+            "--inpaint_output_mode", out_cmd_mode
         ]
-    
-        cmd.append("--use_color_ref")
-        cmd.append("True" if self.use_color_ref else "False")
-
-        cmd.append("--partial_ref_frames")
-        if self.use_color_ref:
-            frames_val = self.spin_partial_ref_frames.value()
-            cmd.append(str(frames_val))
-
-        cmd.append("--frames_chunk")
-        cmd.append(str(self.spin_frames_chunk.value()))        
-                       
-        cmd.append("--downscale_inpainting")
-        cmd.append("True" if self.downscale_inpainting else "False")
-
-        cmd.append("--dilation_mask")
-        cmd.append(str(self.mask_dilation_value))
-
-        cmd.append("--blur_mask")
-        cmd.append(str(self.mask_blur_value))
-
-        
         if self.sbs_mode == "Right eye Only":
             cmd.append("--right_only_1080p")
             cmd.append("True")
-        else:
+            cmd.append("--fsbs_double_height")
+            cmd.append("False")
+            cmd.append("--sbs_mode")
+            cmd.append("HSBS")
+        elif self.sbs_mode == "4KHSBS":
             cmd.append("--right_only_1080p")
             cmd.append("False")
-
-        if self.sbs_mode == "4KHSBS":
             cmd.append("--fsbs_double_height")
             cmd.append("True")
             cmd.append("--sbs_mode")
-            cmd.append("FSBS")               
-               
+            cmd.append("FSBS")
         else:
+            cmd.append("--right_only_1080p")
+            cmd.append("False")
             cmd.append("--fsbs_double_height")
             cmd.append("False")
             cmd.append("--sbs_mode")
-            cmd.append(self.sbs_mode) 
-        
-        inpaint_mode_map = {
-        "8-bit MP4": "mp4",
-        "16-bit EXR seq": "exr16",
-        "32-bit EXR seq": "exr32"
-        }
-        real_inpaint_mode = inpaint_mode_map.get(self.inpaint_output_mode, "mp4")
-        cmd.append("--inpaint_output_mode")
-        cmd.append(real_inpaint_mode)
-        
-        
+            cmd.append(self.sbs_mode)
+        if self.chk_no_inpaint.isChecked():
+            cmd.append("--inpaint")
+            cmd.append("False")
+        else:
+            cmd.append("--inpaint")
+            cmd.append("True")
         if self.color_space_output.strip():
             cmd.append("--color_space")
             cmd.append(self.color_space_output.strip())
-            
-        cmd.append("--num_inference_steps")
-        cmd.append(str(self.inpaint_num_inference_steps_batch))
-        cmd.append(f"--tile_num={self.inpaint_tile_num_batch}")      
-        cmd.append("--encoder")
-        cmd.append(self.output_encoder)
-        cmd.append("--overlap")
-        cmd.append(str(self.inpaint_overlap_batch))
-
         self.batch_inpaint_worker = SubprocessWorker(cmd)
         self.current_batch_worker = self.batch_inpaint_worker
         self.batch_inpaint_worker.lineReady.connect(self.log)
         self.batch_inpaint_worker.finishedSignal.connect(self.on_inpaint_done_batch)
         self.batch_inpaint_worker.start()
 
-        
-
-        
     def on_inpaint_done_batch(self, success):
-        self.current_batch_worker=None
+        self.current_batch_worker = None
         if success:
             self.log("[OK] => inpaint => done (batch item).")
         else:
             self.log("[ERROR] => inpaint => fail (batch item).")
-        self.batch_inpaint_idx+=1
+        self.batch_inpaint_idx += 1
         self.batch_progress_bar.setValue(self.batch_inpaint_idx)
         self.scan_and_list_videos()
         self.process_next_inpaint_in_queue()
+
+    def _inpaint_output_mode_to_folder_or_mp4(self, mode_str):
+        inpaint_map = {
+            "8-bit MP4": "mp4",
+            "16-bit EXR seq": "exr16",
+            "32-bit EXR seq": "exr32"
+        }
+        return inpaint_map.get(mode_str, "mp4")
+
+    def _build_inpaint_output_path_and_check(self, base_, real_mode, directory):
+        if real_mode == "mp4":
+            out_name = base_ + "_splatted_inpainting_results_" + self.sbs_mode + "_" + self.output_encoder + ".mp4"
+            out_path = os.path.join(directory, out_name)
+            return out_path, os.path.isfile(out_path)
+        else:
+            folder_name = base_ + "_splatted_inpainting_results_" + self.sbs_mode + "_" + self.output_encoder + "_" + real_mode
+            out_path = os.path.join(directory, folder_name)
+            if os.path.isdir(out_path):
+                import glob
+                exr_files = glob.glob(os.path.join(out_path, "*.exr"))
+                file_exists = len(exr_files) > 0
+            else:
+                file_exists = False
+            return out_path, file_exists
+
         
         
     def batch_direct_stereo(self):
-        """
-        Runs the entire pipeline for each selected video:
-          - Generate Depth1 and/or Depth2
-          - Merge if needed
-          - Splat
-          - Inpaint
-        all in one go, without stopping until finished or canceled.
-        """
         sel_items = self.list_widget.selectedItems()
         if not sel_items:
             QMessageBox.information(self, "Info", "No items selected for Direct Stereo.")
             return
-
-        # Build the queue
         self.direct_stereo_queue = []
         for it in sel_items:
             dd = it.data(Qt.UserRole)
             if dd:
                 self.direct_stereo_queue.append(dd)
-
         self.direct_stereo_idx = 0
         self.batch_cancelled = False
         self.batch_progress_bar.setValue(0)
         self.batch_progress_bar.setRange(0, len(self.direct_stereo_queue))
-
         self.log(f"[INFO] => Starting Direct Stereo on {len(self.direct_stereo_queue)} items.")
         self.process_next_direct_stereo_in_queue()
 
     def process_next_direct_stereo_in_queue(self):
-        """
-        Moves to the next video in 'self.direct_stereo_queue',
-        resets phase to 0, and starts direct stereo from Depth => Splat => Inpaint.
-        """
         if self.batch_cancelled:
             self.log("[INFO] => Direct Stereo => cancelled => stopping queue.")
             return
         if self.direct_stereo_idx >= len(self.direct_stereo_queue):
             self.log("[INFO] => Direct Stereo => all done!")
             return
-
         self.current_item_data = self.direct_stereo_queue[self.direct_stereo_idx]
         base_ = self.current_item_data.get("base_name", "")
         orig_ = self.current_item_data.get("orig", "")
-
-        # Quick skip if no original
         if not orig_ or not os.path.isfile(orig_):
             self.log(f"[WARN] => {base_} => no original => skipping.")
             self.direct_stereo_idx += 1
             self.batch_progress_bar.setValue(self.direct_stereo_idx)
             self.process_next_direct_stereo_in_queue()
             return
-
-        # We'll run up to 5 phases per item: [Depth1, Depth2, Merge, Splat, Inpaint]
-        # depending on user selections.
         self.direct_stereo_phase = 0
         self.do_direct_stereo_phase()
 
     def do_direct_stereo_phase(self):
-        """
-        Executes the current phase (0..4) for the item in self.current_item_data.
-        On success, calls on_direct_stereo_phase_finished(True).
-        On fail, calls on_direct_stereo_phase_finished(False).
-        """
         if self.batch_cancelled:
             self.log("[INFO] => user cancelled => do_direct_stereo_phase returning.")
             return
-
         base_ = self.current_item_data.get("base_name", "")
         orig_ = self.current_item_data.get("orig", "")
-
-        depth_source_choice = self.combo_batch_depth_source.currentText()  
-        # e.g. "DepthCrafter", "VDA", or "Both"
-        splat_source_choice = self.combo_batch_splat_source.currentText() 
-        # e.g. "depth1", "depth2", "Merged"
-
-        # We'll track output paths here:
-        self.depth1_path = self.current_item_data.get("depth1", "")
-        self.depth2_path = self.current_item_data.get("depth2", "")
-        self.merged_path = self.current_item_data.get("depthf", "")  # merged
-        self.splatted_path = self.current_item_data.get("splatted", "")
-        self.inpainted_path = self.current_item_data.get("inpainted", "")
-
-        # Phase codes:
-        # 0 => generate Depth1 (if needed)
-        # 1 => generate Depth2 (if needed)
-        # 2 => merge Depth1/Depth2 => DepthF (if needed)
-        # 3 => splat
-        # 4 => inpaint
-        # If a phase is not needed, skip to the next.
-
-        # --------------- Phase 0 => Depth1 ---------------
+        if not base_ or not orig_:
+            self.log("[WARN] => do_direct_stereo_phase => no base_/orig_ => skipping.")
+            self.on_direct_stereo_phase_finished(False)
+            return
+        depth_source_choice = self.combo_batch_depth_source.currentText()
+        depth1_out_mp4 = os.path.join(self.pre_depth_edit.text(), base_ + "_depth.mp4")
+        depth2_out_mp4 = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth.mp4")
+        merged_out_mp4 = os.path.join(self.pre_depth_final_edit.text(), base_ + "_depth.mp4")
         if self.direct_stereo_phase == 0:
             if depth_source_choice in ["DepthCrafter", "Both"]:
-                # If depth1 already exists => check overwrite
-                out_path = os.path.join(self.pre_depth_edit.text(), base_ + "_depth.mp4")
-                if not self.check_overwrite_depth.isChecked() and os.path.isfile(out_path):
-                    # ask user
-                    box = QMessageBox(self)
-                    box.setWindowTitle("Overwrite Depth1?")
-                    msg = f"Depth file already exists:\n{out_path}\nOverwrite?"
-                    box.setText(msg)
-                    yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-                    no_btn = box.addButton("No", QMessageBox.NoRole)
-                    all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
-                    box.exec_()
-                    if box.clickedButton() == no_btn:
-                        self.log(f"[INFO] => skipping Depth1 for {base_}.")
-                        self.direct_stereo_phase = 1  # go next
-                        self.do_direct_stereo_phase()
-                        return
-                    elif box.clickedButton() == all_btn:
-                        self.log("[INFO] => user chose 'Yes to all' => enabling Overwrite Depth checkbox.")
-                        self.check_overwrite_depth.setChecked(True)
-
-                # Build command for DepthCrafter
+                real_mode = self._depth_output_mode_to_folder_or_mp4(self.depth_output_mode)
+                out_path, file_exists = self._build_depth_output_path_and_check(base_, real_mode, self.pre_depth_edit.text())
+                if not self._ask_overwrite_if_needed(out_path, file_exists, self.check_overwrite_depth.isChecked(), "skip_overwrite_depth", "Depth1"):
+                    self.direct_stereo_phase = 1
+                    self.do_direct_stereo_phase()
+                    return
                 cmd = [
                     sys.executable, "depth_splatting.py",
                     "--single_video", orig_,
@@ -4855,7 +4467,6 @@ class StereoMasterGUI(QMainWindow):
                     "--max_disp", "0",
                     "--convergence", "0",
                     "--depth_only", "True",
-                    "--stereo_offset_exponent", str(self.poly_exponent),
                     "--orig_brightness_value", str(self.orig_brightness),
                     "--orig_gamma_value", str(self.orig_gamma),
                     "--max_res", str(self.crafter_maxres_value),
@@ -4865,50 +4476,30 @@ class StereoMasterGUI(QMainWindow):
                     "--guidance_scale", f"{self.crafter_guidance_scale:.1f}",
                     "--seed", str(self.crafter_seed),
                 ]
-                depth_mode_map = {
-                    "8-bit MP4": "mp4",
-                    "16-bit EXR seq": "exr16",
-                    "32-bit EXR seq": "exr32"
-                }
-                real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
+                cmd.append("--inpaintRadius")
+                cmd.append(str(self.inpaintRadius))
+                cmd.append("--max_small_hole_area")
+                cmd.append(str(self.max_small_hole_area))
                 cmd.extend(["--depth_output_mode", real_mode])
                 cmd.append("--warp_exponent_base")
-                cmd.append(str(self.warp_exponent_base)) 
+                cmd.append(str(self.warp_exponent_base))
                 self.current_batch_worker = SubprocessWorker(cmd)
                 self.current_batch_worker.lineReady.connect(self.log)
                 self.current_batch_worker.finishedSignal.connect(self.on_direct_stereo_phase_finished)
                 self.current_batch_worker.start()
                 return
-
             else:
-                # not needed => skip
                 self.direct_stereo_phase = 1
                 self.do_direct_stereo_phase()
                 return
-
-        # --------------- Phase 1 => Depth2 ---------------
         if self.direct_stereo_phase == 1:
             if depth_source_choice in ["VDA", "Both"]:
-                out_path = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth.mp4")
-                if not self.check_overwrite_depth.isChecked() and os.path.isfile(out_path):
-                    box = QMessageBox(self)
-                    box.setWindowTitle("Overwrite Depth2?")
-                    msg = f"Depth2 file already exists:\n{out_path}\nOverwrite?"
-                    box.setText(msg)
-                    yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-                    no_btn = box.addButton("No", QMessageBox.NoRole)
-                    all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
-                    box.exec_()
-                    if box.clickedButton() == no_btn:
-                        self.log(f"[INFO] => skipping Depth2 for {base_}.")
-                        self.direct_stereo_phase = 2
-                        self.do_direct_stereo_phase()
-                        return
-                    elif box.clickedButton() == all_btn:
-                        self.log("[INFO] => user chose 'Yes to all' => enabling Overwrite Depth checkbox.")
-                        self.check_overwrite_depth.setChecked(True)
-
-                # Build command for VDA:
+                real_mode = self._depth_output_mode_to_folder_or_mp4(self.depth_output_mode)
+                out_path, file_exists = self._build_depth_output_path_and_check(base_, real_mode, self.pre_depth2_edit.text())
+                if not self._ask_overwrite_if_needed(out_path, file_exists, self.check_overwrite_depth.isChecked(), "skip_overwrite_depth", "Depth2"):
+                    self.direct_stereo_phase = 2
+                    self.do_direct_stereo_phase()
+                    return
                 cmd = [
                     sys.executable, "run.py",
                     "--input_video", orig_,
@@ -4919,64 +4510,36 @@ class StereoMasterGUI(QMainWindow):
                     "--input_size", str(self.vda_input_size),
                     "--encoder", str(self.vda_encoder),
                 ]
-                
-                depth_mode_map = {
-                    "8-bit MP4": "mp4",
-                    "16-bit EXR seq": "exr16",
-                    "32-bit EXR seq": "exr32"
-                }
-                real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
                 cmd.extend(["--depth_output_mode", real_mode])
-
-                
                 if self.vda_use_fp16:
                     cmd.append("--use_fp16")
                 if self.vda_use_cudnn:
                     cmd.append("--use_cudnn_benchmark")
-
-              
                 self.current_batch_worker = SubprocessWorker(cmd)
                 self.current_batch_worker.lineReady.connect(self.log)
                 self.current_batch_worker.finishedSignal.connect(self.on_direct_stereo_phase_finished)
                 self.current_batch_worker.start()
                 return
-
             else:
                 self.direct_stereo_phase = 2
                 self.do_direct_stereo_phase()
                 return
-
-        # --------------- Phase 2 => Merge if "Both" ---------------
         if self.direct_stereo_phase == 2:
             if depth_source_choice == "Both":
-                # same logic as self.merge_depths() but in a subprocess
-                out_ = os.path.join(self.pre_depth_final_edit.text(), base_ + "_depth.mp4")
-                if not self.check_overwrite_depth.isChecked() and os.path.isfile(out_):
-                    box = QMessageBox(self)
-                    box.setWindowTitle("Overwrite Merged Depth?")
-                    msg = f"Merged depth file already exists:\n{out_}\nOverwrite?"
-                    box.setText(msg)
-                    yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-                    no_btn = box.addButton("No", QMessageBox.NoRole)
-                    all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
-                    box.exec_()
-                    if box.clickedButton() == no_btn:
-                        self.log(f"[INFO] => skipping Merge for {base_}.")
-                        # no merged => we continue
-                        self.direct_stereo_phase = 3
-                        self.do_direct_stereo_phase()
-                        return
-                    elif box.clickedButton() == all_btn:
-                        self.check_overwrite_depth.setChecked(True)
-
+                real_mode = self._depth_output_mode_to_folder_or_mp4(self.depth_output_mode)
+                out_path, file_exists = self._build_depth_output_path_and_check(base_, real_mode, self.pre_depth_final_edit.text())
+                if not self._ask_overwrite_if_needed(out_path, file_exists, self.check_overwrite_depth.isChecked(), "skip_overwrite_depth", "Merge(DepthF)"):
+                    self.direct_stereo_phase = 3
+                    self.do_direct_stereo_phase()
+                    return
                 depth1_ = os.path.join(self.pre_depth_edit.text(), base_ + "_depth.mp4")
                 depth2_ = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth.mp4")
                 cmd = [
                     sys.executable, "fusion_depths.py",
                     "--depth1", depth1_,
                     "--depth2", depth2_,
-                    "--alpha", str(self.fusion_alpha/100.0),
-                    "--output", out_,
+                    "--alpha", str(self.fusion_alpha / 100.0),
+                    "--output", out_path,
                     "--brightness_value", str(self.brightness_value),
                     "--gamma_value", str(self.gamma_value),
                     "--dilate_h", str(self.dilate_h_value),
@@ -4984,7 +4547,6 @@ class StereoMasterGUI(QMainWindow):
                     "--blur_ksize", str(self.blur_ksize_value),
                     "--blur_sigma", str(self.blur_sigma_value)
                 ]
-               
                 self.current_batch_worker = SubprocessWorker(cmd)
                 self.current_batch_worker.lineReady.connect(self.log)
                 self.current_batch_worker.finishedSignal.connect(self.on_direct_stereo_phase_finished)
@@ -4994,51 +4556,31 @@ class StereoMasterGUI(QMainWindow):
                 self.direct_stereo_phase = 3
                 self.do_direct_stereo_phase()
                 return
-
-        # --------------- Phase 3 => Splat ---------------
         if self.direct_stereo_phase == 3:
-            # same approach as process_next_splat_in_queue
-            spl_src = self.combo_batch_splat_source.currentText()  # "depth1","depth2","Merged"
-            out_path = os.path.join(self.output_splattings_edit.text(), base_ + "_splatted.mp4")
-            if not self.check_overwrite_splat.isChecked() and os.path.isfile(out_path):
-                box = QMessageBox(self)
-                box.setWindowTitle("Overwrite Splat?")
-                msg = f"File already exists:\n{out_path}\nOverwrite?"
-                box.setText(msg)
-                yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-                no_btn  = box.addButton("No", QMessageBox.NoRole)
-                all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
-                box.exec_()
-                if box.clickedButton() == no_btn:
-                    self.log(f"[INFO] => skipping splat for {base_}.")
-                    self.direct_stereo_phase = 4
-                    self.do_direct_stereo_phase()
-                    return
-                elif box.clickedButton() == all_btn:
-                    self.check_overwrite_splat.setChecked(True)
-
-            # pick depth path:
+            spl_src = self.combo_batch_splat_source.currentText()
             if spl_src == "depth1":
-                dep = os.path.join(self.pre_depth_edit.text(), base_ + "_depth.mp4")
+                dep = depth1_out_mp4
             elif spl_src == "depth2":
-                dep = os.path.join(self.pre_depth2_edit.text(), base_ + "_depth.mp4")
+                dep = depth2_out_mp4
             else:
-                # "Merged"
-                dep = os.path.join(self.pre_depth_final_edit.text(), base_ + "_depth.mp4")
-
+                dep = merged_out_mp4
             if not dep or not os.path.isfile(dep):
                 self.log(f"[WARN] => {base_} => no depth => skipping splat.")
                 self.direct_stereo_phase = 4
                 self.do_direct_stereo_phase()
                 return
-
-            # check for keyframes
+            out_path = os.path.join(self.output_splattings_edit.text(), base_ + "_splatted.mp4")
+            file_exists = os.path.isfile(out_path)
+            if not self._ask_overwrite_if_needed(out_path, file_exists, self.check_overwrite_splat.isChecked(), "skip_overwrite_splat", "Splat"):
+                self.direct_stereo_phase = 4
+                self.do_direct_stereo_phase()
+                return
             keyf_json_path = ""
             if base_ in self.video_params and "keyframes" in self.video_params[base_]:
                 kf_dict = self.video_params[base_]["keyframes"]
                 if kf_dict:
                     real_dict = {}
-                    for k,v in kf_dict.items():
+                    for k, v in kf_dict.items():
                         try:
                             key_int = int(k)
                             real_dict[key_int] = v
@@ -5049,11 +4591,9 @@ class StereoMasterGUI(QMainWindow):
                         try:
                             with open(keyf_json_path, "w", encoding="utf-8") as ff:
                                 json.dump({base_: real_dict}, ff, indent=2)
-                            self.log(f"[INFO] => Keyframes saved => {keyf_json_path}")
                         except Exception as e:
                             self.log(f"[ERROR] => Could not save keyframes => {e}")
                             keyf_json_path = ""
-
             cmd = [
                 sys.executable, "depth_splatting.py",
                 "--single_video", self.current_item_data["orig"],
@@ -5064,7 +4604,6 @@ class StereoMasterGUI(QMainWindow):
                 "--depth_brightness_value", str(self.brightness_value),
                 "--depth_gamma_value", str(self.gamma_value),
                 "--dilate_h", str(self.dilate_h_value),
-                "--stereo_offset_exponent", str(self.poly_exponent),
                 "--dilate_v", str(self.dilate_v_value),
                 "--blur_ksize", str(self.blur_ksize_value),
                 "--blur_sigma", str(self.blur_sigma_value),
@@ -5077,58 +4616,51 @@ class StereoMasterGUI(QMainWindow):
                 "--guidance_scale", f"{self.crafter_guidance_scale:.1f}",
                 "--seed", str(self.crafter_seed),
             ]
-            
-            depth_mode_map = {
-                    "8-bit MP4": "mp4",
-                    "16-bit EXR seq": "exr16",
-                    "32-bit EXR seq": "exr32"
-                }
-            real_mode = depth_mode_map.get(self.depth_output_mode, "mp4")
-
-            cmd.extend(["--depth_output_mode", real_mode])                
+            cmd.append("--crop_border_px")
+            cmd.append(str(self.crop_border_px))
+            cmd.append("--inpaintRadius")
+            cmd.append(str(self.inpaintRadius))
+            cmd.append("--max_small_hole_area")
+            cmd.append(str(self.max_small_hole_area))
+            real_mode = self._depth_output_mode_to_folder_or_mp4(self.depth_output_mode)
+            cmd.extend(["--depth_output_mode", real_mode])
             cmd.append("--warp_exponent_base")
-            cmd.append(str(self.warp_exponent_base)) 
+            cmd.append(str(self.warp_exponent_base))
             if keyf_json_path:
                 cmd.append("--keyframes_json")
                 cmd.append(keyf_json_path)
-
-            
-            cmd.append("--warp_exponent_base")
-            cmd.append(str(self.warp_exponent_base)) 
             self.current_batch_worker = SubprocessWorker(cmd)
             self.current_batch_worker.lineReady.connect(self.log)
             self.current_batch_worker.finishedSignal.connect(self.on_direct_stereo_phase_finished)
             self.current_batch_worker.start()
             return
-
-        # --------------- Phase 4 => Inpaint ---------------
         if self.direct_stereo_phase == 4:
             splatted_ = os.path.join(self.output_splattings_edit.text(), base_ + "_splatted.mp4")
             if not splatted_ or not os.path.isfile(splatted_):
                 self.log(f"[WARN] => {base_} => no splatted => skipping inpaint.")
                 self.end_direct_stereo_item()
                 return
-
-            out_name = f"{base_}_splatted_inpainting_results_{self.sbs_mode}_{self.output_encoder}.mp4"
-            out_path = os.path.join(self.inpainting_out_edit.text(), out_name)
-            if not self.check_overwrite_inpaint.isChecked() and os.path.isfile(out_path):
-                box = QMessageBox(self)
-                box.setWindowTitle("Overwrite Inpaint?")
-                msg = f"Inpaint file already exists:\n{out_path}\nOverwrite?"
-                box.setText(msg)
-                yes_btn = box.addButton("Yes", QMessageBox.YesRole)
-                no_btn  = box.addButton("No",  QMessageBox.NoRole)
-                all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
-                box.exec_()
-                if box.clickedButton() == no_btn:
-                    self.log(f"[INFO] => skipping inpaint for {base_}.")
-                    self.end_direct_stereo_item()
-                    return
-                elif box.clickedButton() == all_btn:
-                    self.check_overwrite_inpaint.setChecked(True)
-
-            orig_ = self.current_item_data.get("orig","")
-
+            inpaint_mode_map = {
+                "8-bit MP4": "mp4",
+                "16-bit EXR seq": "exr16",
+                "32-bit EXR seq": "exr32"
+            }
+            real_inpaint_mode = inpaint_mode_map.get(self.inpaint_output_mode, "mp4")
+            if real_inpaint_mode == "mp4":
+                out_name = f"{base_}_splatted_inpainting_results_{self.sbs_mode}_{self.output_encoder}.mp4"
+                out_path = os.path.join(self.inpainting_out_edit.text(), out_name)
+                file_exists = os.path.isfile(out_path)
+            else:
+                out_name = f"{base_}_splatted_inpainting_results_{self.sbs_mode}_{self.output_encoder}_{real_inpaint_mode}"
+                out_path = os.path.join(self.inpainting_out_edit.text(), out_name)
+                if os.path.isdir(out_path):
+                    exr_files = glob.glob(os.path.join(out_path, "*.exr"))
+                    file_exists = len(exr_files) > 0
+                else:
+                    file_exists = False
+            if not self._ask_overwrite_if_needed(out_path, file_exists, self.check_overwrite_inpaint.isChecked(), "skip_overwrite_inpaint", "Inpaint"):
+                self.end_direct_stereo_item()
+                return
             cmd = [
                 sys.executable, "inpainting.py",
                 "--single_video", splatted_,
@@ -5137,66 +4669,55 @@ class StereoMasterGUI(QMainWindow):
                 "--orig_video", orig_,
                 "--num_inference_steps", str(self.inpaint_num_inference_steps_batch),
                 f"--tile_num={self.inpaint_tile_num_batch}",
-                "--encoder", self.output_encoder
+                "--encoder", self.output_encoder,
+                "--overlap", str(self.inpaint_overlap_batch),
+                "--inpaint_output_mode", real_inpaint_mode
             ]
-               
-
+            if self.chk_no_inpaint.isChecked():
+                cmd.append("--inpaint")
+                cmd.append("False")
+            else:
+                cmd.append("--inpaint")
+                cmd.append("True")
             cmd.append("--use_color_ref")
             cmd.append("True" if self.use_color_ref else "False")
-
             cmd.append("--partial_ref_frames")
             if self.use_color_ref:
-                frames_val = self.spin_partial_ref_frames.value()
-                cmd.append(str(frames_val))
-    
+                cmd.append(str(self.spin_partial_ref_frames.value()))
+            else:
+                cmd.append("0")
             cmd.append("--frames_chunk")
             cmd.append(str(self.spin_frames_chunk.value()))
-               
             cmd.append("--downscale_inpainting")
             cmd.append("True" if self.downscale_inpainting else "False")
-
             cmd.append("--dilation_mask")
             cmd.append(str(self.mask_dilation_value))
-
             cmd.append("--blur_mask")
             cmd.append(str(self.mask_blur_value))
-
             if self.sbs_mode == "Right eye Only":
                 cmd.append("--right_only_1080p")
                 cmd.append("True")
-            else:
+                cmd.append("--fsbs_double_height")
+                cmd.append("False")
+                cmd.append("--sbs_mode")
+                cmd.append("HSBS")
+            elif self.sbs_mode == "4KHSBS":
                 cmd.append("--right_only_1080p")
                 cmd.append("False")
-
-            if self.sbs_mode == "4KHSBS":
                 cmd.append("--fsbs_double_height")
                 cmd.append("True")
                 cmd.append("--sbs_mode")
-                cmd.append("FSBS")               
-               
+                cmd.append("FSBS")
             else:
+                cmd.append("--right_only_1080p")
+                cmd.append("False")
                 cmd.append("--fsbs_double_height")
                 cmd.append("False")
                 cmd.append("--sbs_mode")
                 cmd.append(self.sbs_mode)
-                              
-            inpaint_mode_map = {
-            "8-bit MP4": "mp4",
-            "16-bit EXR seq": "exr16",
-            "32-bit EXR seq": "exr32"
-            }
-            real_inpaint_mode = inpaint_mode_map.get(self.inpaint_output_mode, "mp4")
-            cmd.append("--inpaint_output_mode")
-            cmd.append(real_inpaint_mode)
-      
-      
-            cmd.append("--overlap")
-            cmd.append(str(self.inpaint_overlap_batch))
             if self.color_space_output.strip():
                 cmd.append("--color_space")
                 cmd.append(self.color_space_output.strip())
-
-        
             self.current_batch_worker = SubprocessWorker(cmd)
             self.current_batch_worker.lineReady.connect(self.log)
             self.current_batch_worker.finishedSignal.connect(self.on_direct_stereo_phase_finished)
@@ -5215,13 +4736,12 @@ class StereoMasterGUI(QMainWindow):
             self.end_direct_stereo_item()
             return
 
-        # success => go next phase
         self.direct_stereo_phase += 1
         if self.direct_stereo_phase > 4:
-            # done all phases
+           
             self.end_direct_stereo_item()
         else:
-            # proceed
+          
             self.do_direct_stereo_phase()
                
         
@@ -5345,19 +4865,13 @@ class StereoMasterGUI(QMainWindow):
             self.scan_and_list_videos()
 
     def log(self, *args):
-        # Join everything into a single string
-        line = " ".join(str(a) for a in args)
-        
-        # Always print to console
+        line = " ".join(str(a) for a in args) 
         print(line)
-        
-        # Safely append to log_box if it exists
         if hasattr(self, "log_box") and self.log_box is not None:
             self.log_box.appendPlainText(line)
             self.log_box.verticalScrollBar().setValue(
                 self.log_box.verticalScrollBar().maximum()
             )
-
 
     def store_current_params(self):
         item= self.list_widget.currentItem()
@@ -5380,9 +4894,7 @@ class StereoMasterGUI(QMainWindow):
             "keyframes": old_kf
         }
         self.save_params()
-        
 
- 
     def load_new_video_to_input(self):
         # 1) Seleccionar path
         path, _ = QFileDialog.getOpenFileName(
@@ -5392,14 +4904,14 @@ class StereoMasterGUI(QMainWindow):
             "Videos (*.mp4 *.mov *.avi *.mkv)"
         )
         if not path:
-            return  # Usuario canceló el diálogo
+            return 
 
         bn = os.path.basename(path)
         target = os.path.join(self.input_videos_edit.text(), bn)
 
         from PyQt5.QtWidgets import QMessageBox
 
-        # Si ya existe => preguntar overwrite
+
         if os.path.isfile(target):
             resp = QMessageBox.question(
                 self,
@@ -5411,7 +4923,6 @@ class StereoMasterGUI(QMainWindow):
             if resp == QMessageBox.No:
                 return
 
-        # 2) Verificar frames con decord
         from decord import VideoReader, cpu
         try:
             vr = VideoReader(path, ctx=cpu(0))
@@ -5421,9 +4932,7 @@ class StereoMasterGUI(QMainWindow):
             QMessageBox.warning(self, "Attention", f"Could not open the video:\n{e}")
             self.log(f"[ERROR] => opening {path} => {e}")
             return
-
-        # 3) Si > 400 frames => advertir
-        if n_frames > 400:
+        if n_frames > 500:
             from PyQt5.QtWidgets import QMessageBox, QInputDialog
             import PyQt5.QtWidgets as QtW
 
@@ -5444,7 +4953,7 @@ class StereoMasterGUI(QMainWindow):
                 QtW.QMessageBox.Yes
             )
             if r2 == QtW.QMessageBox.Yes:
-                # => Pedir threshold => Hacer scene detect => RETORNAR (no copiamos)
+
                 thresh, ok = QInputDialog.getInt(
                     self,
                     "Scene Threshold",
@@ -5452,7 +4961,7 @@ class StereoMasterGUI(QMainWindow):
                     35, 1, 999, 1
                 )
                 if ok:
-                    # Llamamos do_scene_detect con path
+           
                     self.log("[INFO] => launching scene detect w/ threshold => " + str(thresh))
                     self.do_scene_detect(threshold=str(thresh), video_path=path)
                 else:
@@ -5460,15 +4969,15 @@ class StereoMasterGUI(QMainWindow):
                 return  
 
             elif r2 == QtW.QMessageBox.No:
-                # => “proceed anyway” => Hacemos la copia
+           
                 self.log("[WARN] => proceeding with large video at user's own risk.")
-                # Continuamos abajo
+   
             else:
-                # CANCEL => no copiamos, no hacemos nada
+  
                 self.log("[INFO] => user cancelled importing video.")
                 return
 
-        # 4) Hacer la copia (solo si no se salió antes)
+
         try:
             self.log(f"[INFO] => Copying '{path}' => '{target}' with progress bar...")
 
@@ -5499,11 +5008,7 @@ class StereoMasterGUI(QMainWindow):
             self.log(f"[ERROR] => copying {path} => {e}")
             return
 
-        # 5) Al final => refrescar
         self.scan_and_list_videos()
-
-
-
 
     ###########################################################
     # SLIDERS => store + updates
@@ -5512,44 +5017,21 @@ class StereoMasterGUI(QMainWindow):
         self.disp_value= float(value)
         self.lbl_disp_val.setText(str(value))
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
 
     def on_conv_slider_changed(self, value):
         self.conv_value= float(value)
         self.lbl_conv_val.setText(str(value))
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
-
+        self.stereo_slider_timer.start()
+        
     def on_brightness_slider_changed(self, value):
         vf= value/100.0
         self.brightness_value= vf
         self.lbl_bri_val.setText(f"{vf:.2f}")
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
         
-    def on_poly_exp_changed(self, value):
-        # slider de 1..300 => factor= value/100 => 0.01..3.0
-        factor = value / 100.0
-        self.poly_exponent = factor
-        self.lbl_poly_exp_val.setText(f"{factor:.2f}")
-
-        # guardamos en la current params
-        self.store_current_params()
-        self.show_preview(self.current_frame_idx)
-
-    def on_poly_fill_changed(self, idx):
-        fill_str = self.combo_poly_fill.currentText()
-        self.poly_fill_tech = fill_str
-        self.store_current_params()
-        self.show_preview(self.current_frame_idx)
-
-    def reset_poly_exp(self):
-        self.poly_exponent = 1.0
-        self.slider_poly_exp.setValue(100)  # 1.00
-        self.lbl_poly_exp_val.setText("1.00")
-        self.store_current_params()
-        self.show_preview(self.current_frame_idx)
-
 
     def on_gamma_slider_changed(self, value):
         vf= value/100.0
@@ -5557,19 +5039,19 @@ class StereoMasterGUI(QMainWindow):
         self.gamma_value= vf
         self.lbl_gam_val.setText(f"{vf:.2f}")
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
 
     def on_dilate_h_changed(self, value):
         self.dilate_h_value= int(value)
         self.lbl_dh_val.setText(str(value))
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
 
     def on_dilate_v_changed(self, value):
         self.dilate_v_value= int(value)
         self.lbl_dv_val.setText(str(value))
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
 
     def on_blur_ksize_changed(self, value):
         if value>0 and value%2==0:
@@ -5578,27 +5060,139 @@ class StereoMasterGUI(QMainWindow):
         self.slider_blur_ksize.setValue(value)
         self.lbl_bk_val.setText(str(value))
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
 
     def on_blur_sigma_changed(self, value):
         vf= value/10.0
         self.blur_sigma_value= vf
         self.lbl_bs_val.setText(f"{vf:.2f}")
         self.store_current_params()
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
 
     def on_orig_brightness_changed(self, value):
         vf= value/100.0
         self.orig_brightness= vf
         self.lbl_orig_bri_val.setText(str(vf))
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
 
     def on_orig_gamma_changed(self, value):
         vf= value/100.0
         if vf<0.01: vf=0.01
         self.orig_gamma= vf
         self.lbl_orig_gam_val.setText(str(vf))
-        self.show_preview(self.current_frame_idx)
+        self.stereo_slider_timer.start()
+        
+        
+        
+    def on_quick_fill_changed(self, state):
+        if state == Qt.Checked:           
+            self.previous_msha_value = self.max_small_hole_area
+            self.spin_max_small_hole_area.setValue(9999999)
+            self.spin_max_small_hole_area.setEnabled(False)
+        else:
+            self.spin_max_small_hole_area.setEnabled(True)
+            if hasattr(self, "previous_msha_value"):
+                self.spin_max_small_hole_area.setValue(self.previous_msha_value)
+            else:
+                self.spin_max_small_hole_area.setValue(0)
+            
+            
+    def on_max_small_hole_area_changed(self, val):
+        self.max_small_hole_area = val
+          
+    
+    def _depth_output_mode_to_folder_or_mp4(self, mode_str):
+        depth_mode_map = {
+            "8-bit MP4": "mp4",
+            "16-bit EXR seq": "exr16",
+            "32-bit EXR seq": "exr32"
+        }
+        return depth_mode_map.get(mode_str, "mp4")
+
+    def _inpaint_output_mode_to_folder_or_mp4(self, mode_str):
+        inpaint_map = {
+            "8-bit MP4": "mp4",
+            "16-bit EXR seq": "exr16",
+            "32-bit EXR seq": "exr32"
+        }
+        return inpaint_map.get(mode_str, "mp4")
+
+    def _build_depth_output_path_and_check(self, base_, real_mode, directory):
+        if real_mode == "mp4":
+            out_name = base_ + "_depth.mp4"
+            out_path = os.path.join(directory, out_name)
+            return out_path, os.path.isfile(out_path)
+        else:
+            folder_name = base_ + "_depth_" + real_mode
+            out_path = os.path.join(directory, folder_name)
+            if os.path.isdir(out_path):
+                import glob
+                exr_files = glob.glob(os.path.join(out_path, "*.exr"))
+                file_exists = len(exr_files) > 0
+            else:
+                file_exists = False
+            return out_path, file_exists
+
+    def _build_inpaint_output_path_and_check(self, base_, real_mode, directory):
+        if real_mode == "mp4":
+            out_name = base_ + "_splatted_inpainting_results_" + self.sbs_mode + "_" + self.output_encoder + ".mp4"
+            out_path = os.path.join(directory, out_name)
+            return out_path, os.path.isfile(out_path)
+        else:
+            folder_name = base_ + "_splatted_inpainting_results_" + self.sbs_mode + "_" + self.output_encoder + "_" + real_mode
+            out_path = os.path.join(directory, folder_name)
+            if os.path.isdir(out_path):
+                import glob
+                exr_files = glob.glob(os.path.join(out_path, "*.exr"))
+                file_exists = len(exr_files) > 0
+            else:
+                file_exists = False
+            return out_path, file_exists
+
+    def _ask_overwrite_if_needed(self, out_path, file_exists, checkBox_overwrite, skip_flag_name, phase_label):
+        if getattr(self, skip_flag_name, False) and file_exists:
+            self.log(f"[INFO] => {phase_label}: skip_flag=True => skipping overwrite => {out_path}")
+            return False
+        if file_exists and not checkBox_overwrite:
+            box = QMessageBox(self)
+            box.setWindowTitle(f"Overwrite? {phase_label}")
+            msg = f"{phase_label} output already exists:\n{out_path}\n\nOverwrite?\n\nYes => Overwrite only this item\nNo => Skip this item\nYes to all => Overwrite all remaining\nNo to all => Skip all remaining"
+            box.setText(msg)
+            yes_btn = box.addButton("Yes", QMessageBox.YesRole)
+            no_btn = box.addButton("No", QMessageBox.NoRole)
+            yes_all_btn = box.addButton("Yes to all", QMessageBox.AcceptRole)
+            no_all_btn = box.addButton("No to all", QMessageBox.RejectRole)
+            box.exec_()
+            if box.clickedButton() == no_btn:
+                self.log(f"[INFO] => {phase_label}: user chose 'No' => skipping overwrite => {out_path}")
+                return False
+            elif box.clickedButton() == yes_all_btn:
+                self.log(f"[INFO] => {phase_label}: user chose 'Yes to all' => Overwrite all.")
+                if phase_label in ["Depth1", "Depth2", "Merge(DepthF)"]:
+                    self.check_overwrite_depth.setChecked(True)
+                elif phase_label == "Splat":
+                    self.check_overwrite_splat.setChecked(True)
+                elif phase_label == "Inpaint":
+                    self.check_overwrite_inpaint.setChecked(True)
+                return True
+            elif box.clickedButton() == no_all_btn:
+                self.log(f"[INFO] => {phase_label}: user chose 'No to all' => skipping all overwrites.")
+                setattr(self, skip_flag_name, True)
+                return False
+            else:
+                self.log(f"[INFO] => {phase_label}: user chose 'Yes' => overwriting => {out_path}")
+                return True
+        return True
+
+
+    
+    def on_flow_threshold_changed(self, val):
+        self.flow_threshold = val
+
+    def on_crop_border_changed(self, val):
+        self.crop_border_px = val
+        self.log(f"[INFO] => crop_border_px = {val}")
+
 
     def on_maxres_changed(self, index):
         val_str = self.max_res_combo.currentText()
