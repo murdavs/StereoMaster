@@ -4816,11 +4816,16 @@ class StereoMasterGUI(QMainWindow):
             if resp== QMessageBox.No:
                 return
         cmd = [
-            ffmpeg_exe, "-y", "-f", "concat", "-safe", "0",
+            ffmpeg_exe, "-y",
+            "-f", "concat", "-safe", "0",
             "-i", temp_txt,
-            "-c", "copy",
+            "-c:v", "libx264",
+            "-crf", "14",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
             out_path
         ]
+
 
         self.log("[INFO] => merging => "+" ".join(cmd))
         self.merge_videos_worker= SubprocessWorker(cmd)
