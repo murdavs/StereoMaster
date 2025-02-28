@@ -38,8 +38,8 @@
    - Use `requirements_cu126.txt` for standard RTX GPUs.  
    - Torch versions are stable releases.
 
-2. **CUDA 12.8 (Nightly) for Blackwell**  
-   - Use `requirements_cu128.txt` if you want to run on the latest NVIDIA Blackwell (RTX 5000 series).  
+2. **CUDA 12.8 (Nightly) for Blackwell Support**  
+   - Use `requirements_cu128.txt` to run the project on the latest NVIDIA GPUs, including those based on the Blackwell architecture (RTX 5000 series), as well as older architectures (Ampere, Turing, etc.)
    - Torch is installed from nightly builds; there is no official xformers wheel yet.
 
 ---
@@ -134,7 +134,7 @@ Ensure it points to the real Python installation
   pip install --use-pep517 --no-cache-dir -r requirements_cu126.txt
   ```
 
-- For Blackwell (CUDA 12.8 nightly):  
+- For Blackwell support (CUDA 12.8 nightly): includes compatibility with older architectures:  
   ```
   pip install --use-pep517 --no-cache-dir -r requirements_cu128.txt
   ```
