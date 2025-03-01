@@ -172,7 +172,7 @@ Expected:
 1. Login in Hugging Face CLI:
 
        
-      huggingface-cli login
+		huggingface-cli login
 
 	  **Add some more info on how to get the token...**  
 	- You need to [create a Hugging Face account](https://huggingface.co/join) if you don’t already have one.  
@@ -192,7 +192,7 @@ Expected:
        git clone https://huggingface.co/tencent/DepthCrafter
        git clone https://huggingface.co/TencentARC/StereoCrafter
 	   
-	   **At 6.2 "Clone the required models..."**  
+	 **At 6.2 "Clone the required models..."**  
 	- If you get an error on your first try, you might need to visit the model page (e.g., [stabilityai/stable-video-diffusion-img2vid-xt-1-1](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1)) in your web browser.  
 	- Go to the **Files** tab and **agree** to the license if prompted.  
 	- After agreeing, the download should work without further issues (though it might take a while to complete).
