@@ -44,7 +44,7 @@
 
 ---
 
-## Installation Guide (Python 3.12 & CUDA 12.6)
+## Installation Guide (Python 3.12 & CUDA)
 
 > **Note:** After you **complete all these steps**, you can **automatically launch StereoMaster** by double-clicking the file **`Launch StereoMaster.bat`** in the repository’s root folder.
 
@@ -96,9 +96,9 @@ Ensure it points to the real Python installation
 
 2. Run the installer and select:
     - C++ CMake tools for Windows  
-    - Windows 10/11 SDK    
+    - Windows 10/11 SDK (latest version)
     - MSVC v143 - VS 2022 C++ x64/x86 (14.40-17.10)  
-	- C++ compilation tools for MSVC v143-VS 2022 for x64/x86 (latest)
+	- C++ build tools for MSVC v143-VS 2022 for x64/x86 (latest)
     - Spectre-mitigated libraries for MSVC v143 – VS 2022 C++ x64/x86 (v14.40–17.10) 
 
    *(If you don’t see these options, check **Individual Components**.)*
