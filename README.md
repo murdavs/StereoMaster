@@ -57,13 +57,9 @@
 
 2. Run the installer and **check** the box **“Add Python to PATH.”**
 
-3. Click **Customize Installation** and enable:
-    - Install pip  
-    - Install venv  
+3. Click **Next** → **Install** → **Finish**.
 
-4. Click **Next** → **Install** → **Finish**.
-
-5. Open **CMD** (Win + R → type `cmd` → press Enter) and run:
+4. Open **CMD** (Win + R → type `cmd` → press Enter) and run:
 
     ```
     python --version
@@ -93,7 +89,24 @@ Ensure it points to the real Python installation
 ---
 
 
-### 3. Install Git
+### 3. Install Visual Studio Build Tools
+
+1. Download from:  
+   [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+
+2. Run the installer and select:
+    - C++ CMake tools for Windows  
+    - Windows 10/11 SDK    
+    - MSVC v143 - VS 2022 C++ x64/x86 (14.40-17.10)  
+	- C++ compilation tools for MSVC v143-VS 2022 for x64/x86 (latest)
+    - Spectre-mitigated libraries for MSVC v143 – VS 2022 C++ x64/x86 (v14.40–17.10) 
+
+   *(If you don’t see these options, check **Individual Components**.)*
+
+
+---
+
+### 4. Install Git
 
 1. Download from:  
    [Git for Windows](https://git-scm.com/download/win)
@@ -104,7 +117,7 @@ Ensure it points to the real Python installation
 ---	
 
 
-### 4. Clone the StereoMaster Repository
+### 5. Clone the StereoMaster Repository
 
     cd C:\
     git clone https://github.com/murdavs/StereoMaster.git
@@ -112,7 +125,7 @@ Ensure it points to the real Python installation
 
 ---
 
-### 5. Create a Virtual Environment & Install Dependencies
+### 6. Create a Virtual Environment & Install Dependencies
 
 1. Create a new virtual environment:
 
@@ -159,9 +172,16 @@ Expected:
 1. Login in Hugging Face CLI:
 
        
-       huggingface-cli login
+      huggingface-cli login
 
-   > Get your token here: [Hugging Face Token Settings](https://huggingface.co/settings/tokens)
+	  **Add some more info on how to get the token...**  
+	- You need to [create a Hugging Face account](https://huggingface.co/join) if you don’t already have one.  
+	- Once logged in, go to [Settings > Access Tokens](https://huggingface.co/settings/tokens).  
+	- Click **New token** and name it however you like.  
+	- For simplicity, you can check all the permission scopes available (or only those you specifically need).
+
+	> **Note:** When you paste your token in the console (e.g., after running `huggingface-cli login`), you might not see it appear on-screen for security reasons, but it is actually there!
+
 
 2. Clone the required models into a `weights` folder:
 
@@ -171,6 +191,12 @@ Expected:
        git clone https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1
        git clone https://huggingface.co/tencent/DepthCrafter
        git clone https://huggingface.co/TencentARC/StereoCrafter
+	   
+	   **At 6.2 "Clone the required models..."**  
+	- If you get an error on your first try, you might need to visit the model page (e.g., [stabilityai/stable-video-diffusion-img2vid-xt-1-1](https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt-1-1)) in your web browser.  
+	- Go to the **Files** tab and **agree** to the license if prompted.  
+	- After agreeing, the download should work without further issues (though it might take a while to complete).
+	
 
 3. Download depth models:
 
