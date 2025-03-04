@@ -946,7 +946,11 @@ class StereoMasterGUI(QMainWindow):
 
         self.btn_scene_detect = QPushButton("Scene Detect / Split")
         self.btn_scene_detect.setFixedHeight(28)
-        self.btn_scene_detect.clicked.connect(self.do_scene_detect)
+        self.btn_scene_detect.clicked.connect(
+            lambda: self.do_scene_detect(
+                self.combo_scene_threshold.currentText().strip()
+            )
+        )
 
         row_scene.addWidget(self.btn_scene_detect)
         row_scene.addWidget(self.label_threshold)
@@ -2337,24 +2341,15 @@ class StereoMasterGUI(QMainWindow):
     # SCENE DETECT
     ###########################################################
     
-    def do_scene_detect(self, threshold=None, video_path=None):
-        """
-        Lanza SceneDetect en un SubprocessWorker. 'threshold' y 'video_path'
-        son opcionales; si no llegan, usamos la UI (self.combo_scene_threshold
-        y self.selected_video_path).
-        """
-        import os
-        import sys
+    def do_scene_detect(self, threshold_str, video_path=None):
 
-        if threshold is None:
-            threshold_str = self.combo_scene_threshold.currentText().strip()
-            if not threshold_str.isdigit():
-                QMessageBox.warning(self, "Attention", "Threshold must be numeric.")
-                return
-            threshold = threshold_str
-        else:
-            threshold = str(threshold)
-
+        try:
+            float(threshold_str)
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Threshold must be numeric.")
+            return
+            
+        threshold = threshold_str
 
         if video_path is None:
             if not self.selected_video_path:
@@ -3740,7 +3735,6 @@ class StereoMasterGUI(QMainWindow):
         
         
     def update_save_button_text(self):
-
         item = self.list_widget.currentItem()
         if not item:
             self.btn_save_video_settings.setText("Save Settings (No video selected)")
@@ -3759,9 +3753,20 @@ class StereoMasterGUI(QMainWindow):
             self.btn_save_video_settings.setEnabled(False)
             return
 
-        self.btn_save_video_settings.setText(f"Save Settings for {base_name}")
+        shortened = self.truncate_with_ellipsis(base_name, max_length=20)
+
+        self.btn_save_video_settings.setText(f"Save Settings for {shortened}")
         self.btn_save_video_settings.setEnabled(True)
-    
+
+        self.btn_save_video_settings.setToolTip(f"Full name: {base_name}")
+
+
+    def truncate_with_ellipsis(self, text: str, max_length: int = 20) -> str:
+        if len(text) <= max_length:
+            return text
+        else:
+            return text[:(max_length - 3)] + "..."
+
 
     def on_mask_blur_changed(self, new_value):  
         going_down = (new_value < self.mask_blur_value)  

@@ -993,7 +993,6 @@ def process_single_video_in_chunks(
             cmd_params = [
                 "-crf", str(crf),
                 "-preset", "slow",
-                "-profile:v", "high10",
                 "-colorspace", "bt709",
                 "-color_primaries", "bt709",
                 "-color_trc", "bt709",
